@@ -105,6 +105,8 @@ struct DownloadItem: Identifiable {
     var detail: String = ""
     var needsAuth = false
     var credentials = Credentials()
+    var needsFinder = false
+    var direct: DirectJob?
 }
 
 // MARK: - Tools (yt-dlp, deno, ffmpeg)
@@ -181,6 +183,24 @@ enum Tools {
         _ = try? runQuick("/usr/bin/xattr", ["-d", "com.apple.quarantine", url.path])
     }
 
+    /// Runs a tool off the main thread and returns its exit code and standard output.
+    static func capture(_ exe: String, _ args: [String]) async -> (Int32, String) {
+        await withCheckedContinuation { (c: CheckedContinuation<(Int32, String), Never>) in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: exe)
+                p.arguments = args
+                let pipe = Pipe()
+                p.standardOutput = pipe
+                p.standardError = FileHandle.nullDevice
+                do { try p.run() } catch { c.resume(returning: (-1, "")); return }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                c.resume(returning: (p.terminationStatus, String(data: data, encoding: .utf8) ?? ""))
+            }
+        }
+    }
+
     @discardableResult
     static func runQuick(_ exe: String, _ args: [String]) throws -> Int32 {
         let p = Process()
@@ -231,6 +251,7 @@ final class DownloadModel: ObservableObject {
         didSet { UserDefaults.standard.set(browser.rawValue, forKey: "browser") }
     }
     @Published var authItemID: UUID?          // drives the "needs a password" sheet
+    @Published var finderTarget: FinderTarget? // drives the "find the video on the page" window
     @Published var needsFullDiskAccess = false
     @Published var items: [DownloadItem] = []
     @Published var isRunning = false
@@ -244,6 +265,15 @@ final class DownloadModel: ObservableObject {
     private var current: Process?
     private var cancelRequested = false
     private var lastErrors: [Int: String] = [:]
+    private var lastFiles: [Int: String] = [:]
+
+    /// Sites the downloader can't read, so we go straight to finding the file on the page.
+    static let finderHosts = ["gotowebinar.com", "goto.com", "gotomeeting.com", "gotostage.com", "gotowebinar.cn"]
+
+    static func needsFinder(_ link: String) -> Bool {
+        guard let host = URL(string: link)?.host?.lowercased() else { return false }
+        return finderHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -333,12 +363,16 @@ final class DownloadModel: ObservableObject {
         Task {
             for i in items.indices {
                 if cancelRequested { items[i].status = .cancelled; continue }
+                if Self.needsFinder(items[i].url) {
+                    items[i].needsFinder = true
+                    items[i].detail = "Finding the video on the page…"
+                    continue
+                }
                 await download(index: i)
             }
             isRunning = false
             current = nil
-            // Ask for credentials for the first video that needed them.
-            if let first = items.first(where: { $0.needsAuth }) { authItemID = first.id }
+            promptNext()
         }
     }
 
@@ -364,7 +398,51 @@ final class DownloadModel: ObservableObject {
             await download(index: i)
             isRunning = false
             current = nil
-            if let next = items.first(where: { $0.needsAuth }) { authItemID = next.id }
+            promptNext()
+        }
+    }
+
+    /// After a run: open the video finder for the next page that needs it, otherwise ask for a password.
+    private func promptNext() {
+        if let f = items.first(where: { $0.needsFinder }), let url = URL(string: f.url) {
+            finderTarget = FinderTarget(id: f.id, url: url)
+        } else if let first = items.first(where: { $0.needsAuth }) {
+            authItemID = first.id
+        }
+    }
+
+    func openFinder(itemID: UUID) {
+        guard let item = items.first(where: { $0.id == itemID }), let url = URL(string: item.url) else { return }
+        finderTarget = FinderTarget(id: itemID, url: url)
+    }
+
+    func finderCancelled(itemID: UUID) {
+        finderTarget = nil
+        if let i = items.firstIndex(where: { $0.id == itemID }) {
+            items[i].needsFinder = false
+            items[i].status = .cancelled
+            items[i].detail = ""
+        }
+        promptNext()
+    }
+
+    /// The finder located the file: download it (and its sound, if separate).
+    func startDirect(itemID: UUID, job: DirectJob) {
+        finderTarget = nil
+        guard let i = items.firstIndex(where: { $0.id == itemID }) else { return }
+        items[i].direct = job
+        items[i].needsFinder = false
+        items[i].title = job.title
+        items[i].progress = 0
+        items[i].status = .waiting
+        guard !isRunning else { return }
+        isRunning = true
+        cancelRequested = false
+        Task {
+            await download(index: i)
+            isRunning = false
+            current = nil
+            promptNext()
         }
     }
 
@@ -424,10 +502,42 @@ final class DownloadModel: ObservableObject {
         items[i].detail = "Starting…"
         appendLog("▶︎ \(items[i].url)")
         lastErrors[i] = nil
-        let args = arguments(for: items[i])
-        let dir = folder
 
-        let code: Int32 = await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
+        var ok: Bool
+        var note = ""
+        if let job = items[i].direct {
+            (ok, note) = await downloadDirect(index: i, job: job)
+            try? FileManager.default.removeItem(at: job.cookiesFile)
+        } else {
+            ok = await runYtdlp(arguments(for: items[i]), index: i) == 0
+        }
+
+        // Let any queued output lines land first.
+        await Task.yield()
+        if cancelRequested {
+            items[i].status = .cancelled
+            items[i].detail = ""
+        } else if ok {
+            items[i].status = .done
+            items[i].progress = 1
+            items[i].detail = note
+        } else {
+            let err = lastErrors[i] ?? "The download didn't finish. See the log."
+            items[i].status = .failed
+            if items[i].direct == nil && isFinderError(err) {
+                // The downloader can't read this page: look for the file on the page instead.
+                items[i].needsFinder = true
+                items[i].detail = "Finding the video on the page…"
+            } else {
+                items[i].needsAuth = items[i].direct == nil && isAuthError(err)
+                items[i].detail = friendly(err)
+            }
+        }
+    }
+
+    private func runYtdlp(_ args: [String], index i: Int) async -> Int32 {
+        let dir = folder
+        return await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
             let p = Process()
             p.executableURL = Tools.ytdlp
             p.arguments = args
@@ -458,26 +568,129 @@ final class DownloadModel: ObservableObject {
                 cont.resume(returning: -1)
             }
         }
+    }
 
-        // Let any queued output lines land first.
-        await Task.yield()
-        if cancelRequested {
-            items[i].status = .cancelled
-            items[i].detail = ""
-        } else if code == 0 {
-            items[i].status = .done
-            items[i].progress = 1
-            items[i].detail = ""
-        } else {
-            let err = lastErrors[i] ?? "yt-dlp exited with code \(code). See log."
-            items[i].status = .failed
-            items[i].needsAuth = isAuthError(err)
-            items[i].detail = friendly(err)
+    // MARK: Files found on a page
+
+    private static let progressTemplate = "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"
+
+    private func directArgs(_ job: DirectJob, output: String) -> [String] {
+        var a = [
+            "--newline", "--color", "never", "--no-playlist",
+            "-P", folder.path, "-o", output,
+            "--progress-template", Self.progressTemplate,
+            "--print", "after_move:FILE %(filepath)s", "--no-simulate",
+            "--referer", job.referer,
+            "--add-header", "User-Agent:\(job.userAgent)",
+            "--cookies", job.cookiesFile.path,
+        ]
+        if let ff = ffmpeg { a += ["--ffmpeg-location", ff.deletingLastPathComponent().path] }
+        return a
+    }
+
+    /// Returns (success, note for the row).
+    private func downloadDirect(index i: Int, job: DirectJob) async -> (Bool, String) {
+        let name = Self.safeName(job.title)
+        let template = name.replacingOccurrences(of: "%", with: "%%")
+
+        // A stream link (m3u8/mpd) already describes picture + sound; the downloader joins them.
+        if job.primaryIsManifest {
+            var a = directArgs(job, output: "\(template).%(ext)s")
+            if ffmpeg != nil {
+                if quality == .audio {
+                    a += ["-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
+                } else {
+                    let res = quality.height.map { "res:\($0)" } ?? "res"
+                    a += ["-f", "bv*+ba/b", "-S", "\(res),vcodec:h264,acodec:m4a", "--merge-output-format", "mp4"]
+                }
+            }
+            return (await runYtdlp(a + ["--", job.primary], index: i) == 0, "")
         }
+
+        // A whole file: download it, then check it has sound.
+        lastFiles[i] = nil
+        guard await runYtdlp(directArgs(job, output: "\(template).part-video.%(ext)s") + ["--", job.primary], index: i) == 0,
+              let videoPath = lastFiles[i] else { return (false, "") }
+
+        guard let ff = ffmpeg, let probe = Tools.find("ffprobe") else {
+            finalize(videoPath, name: name)
+            return (true, "")
+        }
+        let videoStreams = await Self.streams(videoPath, probe: probe)
+        if videoStreams.contains("audio") || !videoStreams.contains("video") {
+            finalize(videoPath, name: name)
+            return (true, "")
+        }
+
+        // Picture only: find the separate sound file and join the two.
+        var n = 0
+        for candidate in job.audioCandidates + job.otherVideos {
+            if cancelRequested { break }
+            n += 1
+            items[i].detail = "Getting the sound…"
+            lastFiles[i] = nil
+            guard await runYtdlp(directArgs(job, output: "\(template).part-sound\(n).%(ext)s") + ["--", candidate], index: i) == 0,
+                  let soundPath = lastFiles[i] else { continue }
+            let s = await Self.streams(soundPath, probe: probe)
+            guard s.contains("audio"), !s.contains("video") else {
+                try? FileManager.default.removeItem(atPath: soundPath)
+                continue
+            }
+            items[i].status = .processing
+            items[i].detail = "Joining picture and sound…"
+            let out = Self.uniqueURL(in: folder, name: name, ext: "mp4")
+            var (code, _) = await Tools.capture(ff.path, ["-y", "-loglevel", "error", "-i", videoPath, "-i", soundPath,
+                                                          "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+                                                          "-movflags", "+faststart", out.path])
+            if code != 0 {
+                (code, _) = await Tools.capture(ff.path, ["-y", "-loglevel", "error", "-i", videoPath, "-i", soundPath,
+                                                          "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                                                          "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path])
+            }
+            if code == 0 {
+                try? FileManager.default.removeItem(atPath: videoPath)
+                try? FileManager.default.removeItem(atPath: soundPath)
+                appendLog("Saved \(out.path)")
+                return (true, "")
+            }
+            try? FileManager.default.removeItem(atPath: soundPath)
+        }
+        finalize(videoPath, name: name)
+        return (true, "Saved, but no sound track was found on the page.")
+    }
+
+    private func finalize(_ path: String, name: String) {
+        let src = URL(fileURLWithPath: path)
+        let dest = Self.uniqueURL(in: src.deletingLastPathComponent(), name: name, ext: src.pathExtension)
+        if (try? FileManager.default.moveItem(at: src, to: dest)) != nil { appendLog("Saved \(dest.path)") }
+    }
+
+    static func safeName(_ title: String) -> String {
+        let bad = CharacterSet(charactersIn: "/\\:*?\"<>|\n\r\t")
+        let cleaned = title.components(separatedBy: bad).joined(separator: "-").trimmingCharacters(in: .whitespaces)
+        return cleaned.isEmpty ? "Webinar" : String(cleaned.prefix(120))
+    }
+
+    static func uniqueURL(in dir: URL, name: String, ext: String) -> URL {
+        var url = dir.appendingPathComponent("\(name).\(ext)")
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(name) (\(n)).\(ext)")
+            n += 1
+        }
+        return url
+    }
+
+    /// Which kinds of stream ("video", "audio") a file contains.
+    static func streams(_ path: String, probe: URL) async -> Set<String> {
+        let (_, out) = await Tools.capture(probe.path, ["-v", "error", "-show_entries", "stream=codec_type",
+                                                        "-of", "csv=p=0", path])
+        return Set(out.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) })
     }
 
     private func handle(line: String, index i: Int) {
         if line.hasPrefix("ERROR") { lastErrors[i] = line }
+        if line.hasPrefix("FILE ") { lastFiles[i] = String(line.dropFirst(5)) }
         guard items.indices.contains(i), !items[i].status.isFinal else {
             appendLog(line); return
         }
@@ -501,6 +714,12 @@ final class DownloadModel: ObservableObject {
             items[i].detail = "Merging / converting…"
         }
         appendLog(line)
+    }
+
+    private func isFinderError(_ error: String) -> Bool {
+        let e = error.lowercased()
+        return ["unsupported url", "no video formats", "unable to extract", "no media", "not a valid url"]
+            .contains { e.contains($0) }
     }
 
     private func isAuthError(_ error: String) -> Bool {
@@ -603,7 +822,14 @@ struct ContentView: View {
             }
 
             List(model.items) { item in
-                ItemRow(item: item, canUnlock: !model.isRunning) { model.authItemID = item.id }
+                ItemRow(item: item, canUnlock: !model.isRunning,
+                        onUnlock: { model.authItemID = item.id },
+                        onFind: { model.openFinder(itemID: item.id) })
+            }
+            .sheet(item: $model.finderTarget) { target in
+                FinderSheet(target: target,
+                            onDownload: { job in model.startDirect(itemID: target.id, job: job) },
+                            onCancel: { model.finderCancelled(itemID: target.id) })
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .frame(minHeight: 140)
@@ -704,6 +930,7 @@ struct ItemRow: View {
     let item: DownloadItem
     var canUnlock = true
     var onUnlock: () -> Void = {}
+    var onFind: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -711,6 +938,9 @@ struct ItemRow: View {
                 icon
                 Text(item.title ?? item.url).lineLimit(1).truncationMode(.middle)
                 Spacer()
+                if item.needsFinder && item.status != .waiting && canUnlock {
+                    Button("Find Video…", action: onFind).controlSize(.small)
+                }
                 if item.needsAuth {
                     Button("Unlock…", action: onUnlock).controlSize(.small).disabled(!canUnlock)
                 }

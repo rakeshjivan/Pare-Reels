@@ -21,13 +21,13 @@ if [ "${UNIVERSAL:-0}" = "1" ]; then
   echo "Building Pare Reels (Apple Silicon + Intel)…"
   for A in arm64 x86_64; do
     xcrun swiftc -O -parse-as-library -swift-version 5 \
-      -target "${A}-apple-macos13.0" Sources/PareReelsApp.swift -o "build/PareReels-$A"
+      -target "${A}-apple-macos13.0" Sources/*.swift -o "build/PareReels-$A"
   done
   lipo -create build/PareReels-arm64 build/PareReels-x86_64 -output "$APP/Contents/MacOS/PareReels"
 else
   echo "Building Pare Reels for $ARCH…"
   xcrun swiftc -O -parse-as-library -swift-version 5 \
-    -target "${ARCH}-apple-macos13.0" Sources/PareReelsApp.swift -o "$APP/Contents/MacOS/PareReels"
+    -target "${ARCH}-apple-macos13.0" Sources/*.swift -o "$APP/Contents/MacOS/PareReels"
 fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'

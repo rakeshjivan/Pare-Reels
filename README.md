@@ -23,6 +23,11 @@ Pare Reels downloads its helper tools into `~/Library/Application Support/Pare R
 - Quality: Best, 4K, 1440p, 1080p, 720p, 480p, or Audio only (MP3). At 1080p and below the app prefers H.264, so files play in QuickTime. YouTube only offers 1440p and 4K as VP9 or AV1, which may need IINA or VLC to play.
 - Works with YouTube, Vimeo, ON24 and many other sites. GoToWebinar has no dedicated support, so whether a link works varies.
 
+## Recorded webinars on other sites (GoTo and similar)
+Paste the link as normal. If the downloader can't read the page, Pare Reels opens it in a small window, starts the video muted and finds the actual video file. The window then closes by itself and the app saves **one MP4 with sound**. If the page keeps the sound in a separate file, the app downloads both and joins them.
+- If the page asks you to log in, register or click Play, do that in the window. Your login is remembered for next time.
+- This works for recorded webinars only. Live streams have no file to save.
+
 ## Webinars behind a login
 - **Use login from:** log in to the site once in Safari, Chrome, Firefox, Edge or Brave, then pick that browser here.
   - Chrome, Edge and Brave ask for your Mac password once. Click **Always Allow**.
