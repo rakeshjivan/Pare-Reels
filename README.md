@@ -10,7 +10,7 @@ The app isn't signed by Apple, so the first time you open it macOS blocks it. Go
 **Or build it yourself** (no Gatekeeper warning): in Terminal, run `bash build.sh` in this folder. If Apple's Command Line Tools aren't installed, the script prompts you to install them.
 
 ## Publish a new version
-Click **Actions › Build Pare Reels › Run workflow** to get a test build, or push a tag like `v1.1` to publish a release.
+Every change pushed to `main` builds the app and publishes it as the latest release automatically.
 
 ## First launch
 Pare Reels downloads its helper tools into `~/Library/Application Support/Pare Reels/bin`:

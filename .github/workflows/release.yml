@@ -2,7 +2,7 @@ name: Build Pare Reels
 
 on:
   push:
-    tags: ["v*"]        # push a tag like v1.1 to publish a release
+    branches: [main]    # every change to main builds and publishes a release
   workflow_dispatch:    # or click "Run workflow" on the Actions tab
 
 permissions:
@@ -23,8 +23,10 @@ jobs:
           name: Pare-Reels-mac
           path: Pare-Reels-mac.zip
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: build-${{ github.run_number }}
+          name: Pare Reels (build ${{ github.run_number }})
           files: Pare-Reels-mac.zip
+          make_latest: true
           generate_release_notes: true
