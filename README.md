@@ -21,7 +21,8 @@ Pare Reels downloads its helper tools into `~/Library/Application Support/Pare R
 ## Use
 - Put one link per line. Playlist links download the whole playlist. A video link with `&list=` in it downloads only that video.
 - Quality: Best, 4K, 1440p, 1080p, 720p, 480p, or Audio only (MP3). At 1080p and below the app prefers H.264, so files play in QuickTime. YouTube only offers 1440p and 4K as VP9 or AV1, which may need IINA or VLC to play.
-- Works with YouTube, Vimeo, ON24 and many other sites. GoToWebinar has no dedicated support, so whether a link works varies.
+- Works with YouTube, Vimeo, ON24, Zoom recordings (`zoom.us/rec/…`), Instagram, TikTok, Facebook and many other sites. Pages the downloader can't read, such as GoToWebinar, use the video finder described below.
+- For Instagram, and for Facebook private groups, set **Use login from** to the browser you're logged in with.
 
 ## Recorded webinars on other sites (GoTo and similar)
 Paste the link as normal. If the downloader can't read the page, Pare Reels opens it in a small window, starts the video muted and finds the actual video file. The window then closes by itself and the app saves **one MP4 with sound**. If the page keeps the sound in a separate file, the app downloads both and joins them.

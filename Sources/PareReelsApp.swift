@@ -524,7 +524,7 @@ final class DownloadModel: ObservableObject {
         } else {
             let err = lastErrors[i] ?? "The download didn't finish. See the log."
             items[i].status = .failed
-            if items[i].direct == nil && isFinderError(err) {
+            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err)) {
                 // The downloader can't read this page: look for the file on the page instead.
                 items[i].needsFinder = true
                 items[i].detail = "Finding the video on the page…"
@@ -720,6 +720,13 @@ final class DownloadModel: ObservableObject {
         let e = error.lowercased()
         return ["unsupported url", "no video formats", "unable to extract", "no media", "not a valid url"]
             .contains { e.contains($0) }
+    }
+
+    /// Pages that want you to register or confirm your email (e.g. Zoom webinar recordings):
+    /// open them in the finder window so you can do that once, then grab the file.
+    private func needsRegistration(_ error: String) -> Bool {
+        let e = error.lowercased()
+        return ["registration", "register", "email authentication", "requires email", "sign up"].contains { e.contains($0) }
     }
 
     private func isAuthError(_ error: String) -> Bool {
