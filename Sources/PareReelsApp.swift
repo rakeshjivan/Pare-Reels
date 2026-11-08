@@ -320,6 +320,7 @@ final class DownloadModel: ObservableObject {
             .components(separatedBy: .whitespacesAndNewlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { $0.lowercased().hasPrefix("http") }
+            .map(Self.unwrap)
         guard !urls.isEmpty else {
             notice = "Paste at least one link starting with http."
             return
@@ -339,6 +340,15 @@ final class DownloadModel: ObservableObject {
             // Ask for credentials for the first video that needed them.
             if let first = items.first(where: { $0.needsAuth }) { authItemID = first.id }
         }
+    }
+
+    /// Unwraps Outlook "Safe Links" (…safelinks.protection.outlook.com/?url=…) to the real address.
+    static func unwrap(_ link: String) -> String {
+        guard let comps = URLComponents(string: link),
+              let host = comps.host?.lowercased(), host.hasSuffix("safelinks.protection.outlook.com"),
+              let inner = comps.queryItems?.first(where: { $0.name == "url" })?.value,
+              inner.lowercased().hasPrefix("http") else { return link }
+        return inner
     }
 
     /// Re-run one item with the credentials typed into the sheet.
