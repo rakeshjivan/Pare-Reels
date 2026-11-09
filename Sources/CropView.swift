@@ -642,7 +642,8 @@ final class CropModel: ObservableObject {
             let b = i == pieces - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(pieces)
             let out = work.appendingPathComponent("part\(i).mp4")
             parts.append((out, (b - a) / sp))
-            jobs.append(["-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
+            // -t before -i: limits how much of the original is read (so pieces never overlap, even when sped up).
+            jobs.append(["-ss", String(format: "%.3f", a), "-t", String(format: "%.3f", b - a), "-i", src.path,
                          "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
                          ] + encoder + [out.path])
         }
@@ -720,8 +721,8 @@ final class CropModel: ObservableObject {
         func args(_ encoder: [String], decode: [String] = []) -> [String] {
             var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode
             if trimIt && start > 0 { a += ["-ss", String(format: "%.3f", start)] }   // exact when re-encoding
+            if trimIt { a += ["-t", String(format: "%.3f", length)] }   // before -i: limits what's read
             a += ["-i", src.path]
-            if trimIt { a += ["-t", String(format: "%.3f", length)] }
             a += ["-map", "0:v:0", "-map", "0:a?"]
             if cropIt {
                 // Change-only encoding: frames identical to the previous one (inside the crop) are not
