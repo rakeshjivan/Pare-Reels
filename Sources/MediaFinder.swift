@@ -241,11 +241,42 @@ struct FinderWebView: NSViewRepresentable {
             Task { @MainActor [weak finder] in finder?.add(u) }
         }
 
-        // Links that open a new window (common for "Watch recording" buttons) open here instead.
+        private var popups: [ObjectIdentifier: NSWindow] = [:]
+
+        // Sign-in popups ("Sign in with Google", Microsoft, etc.) get their own small window,
+        // linked to the page so the login completes. Ordinary "open in new tab" links open here instead.
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                      for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-            if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
-            return nil
+            guard navigationAction.targetFrame == nil else { return nil }
+            let isPopup = windowFeatures.width != nil || windowFeatures.height != nil
+            guard isPopup else {
+                webView.load(navigationAction.request)
+                return nil
+            }
+            let w = CGFloat(windowFeatures.width?.doubleValue ?? 520)
+            let h = CGFloat(windowFeatures.height?.doubleValue ?? 640)
+            let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
+            popup.customUserAgent = MediaFinder.userAgent
+            popup.uiDelegate = self
+            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+                               styleMask: [.titled, .closable, .resizable],
+                               backing: .buffered, defer: false)
+            win.title = "Sign in"
+            win.isReleasedWhenClosed = false
+            win.level = .floating
+            win.contentView = popup
+            win.center()
+            win.makeKeyAndOrderFront(nil)
+            popups[ObjectIdentifier(popup)] = win
+            return popup
+        }
+
+        // The sign-in page closed itself (window.close()) once you'd logged in.
+        func webViewDidClose(_ webView: WKWebView) {
+            if let win = popups.removeValue(forKey: ObjectIdentifier(webView)) {
+                win.orderOut(nil)
+                win.contentView = nil
+            }
         }
 
         // A link straight to a video file: record it rather than letting the browser try to save it.
