@@ -64,6 +64,8 @@ final class CropModel: ObservableObject {
     enum Engine: String, CaseIterable, Identifiable { case apple = "Apple", ffmpeg = "ffmpeg"; var id: String { rawValue } }
     @Published var engine: Engine = .apple    // testing switch: which pipeline Save uses
     private var exportSession: AVAssetExportSession?
+    private var partSessions: [AVAssetExportSession] = []
+    private var partsNote = ""
     private var exportError: String?
     private var fastEncoder = ""
     @Published var status: String?
@@ -207,6 +209,7 @@ final class CropModel: ObservableObject {
         cancelled = true
         process?.terminate()
         exportSession?.cancelExport()
+        partSessions.forEach { $0.cancelExport() }
         if method == .secure { secure.cancel() }
     }
 
@@ -251,9 +254,9 @@ final class CropModel: ObservableObject {
             switch how {
             case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
             case .fast:
-                if engine == .apple, let r = await saveApple(src: src, rect: rect) {
+                if engine == .apple, let r = await saveAppleParallel(src: src, ff: ff, rect: rect) {
                     result = r
-                    note = " Engine: Apple."
+                    note = " Engine: Apple\(partsNote)."
                 } else if !cancelled {
                     if engine == .apple { note = " Apple engine failed (\(exportError ?? "unknown")), so ffmpeg was used." }
                     result = await saveFast(src: src, ff: ff, rect: rect)
@@ -384,6 +387,115 @@ final class CropModel: ObservableObject {
         exportError = ex.error?.localizedDescription ?? "status \(ex.status.rawValue)"
         try? FileManager.default.removeItem(at: out)
         return nil
+    }
+
+    /// Splits the kept time range into parts, exports them side by side on the video hardware
+    /// (picture only), then joins them losslessly and adds the original sound.
+    private func saveAppleParallel(src: URL, ff: URL, rect: CGRect) async -> URL? {
+        let mediaLen = isTrimmed ? trimEnd - trimStart : duration
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let parts = mediaLen < 120 ? 1 : min(4, max(2, cores / 2))
+        partsNote = ""
+        if parts == 1 { return await saveApple(src: src, rect: rect) }
+        exportError = nil
+
+        let asset = AVURLAsset(url: src)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let transform = try? await track.load(.preferredTransform),
+              let trackRange = try? await track.load(.timeRange) else { exportError = "no video track"; return nil }
+        let fps = (try? await track.load(.nominalFrameRate)) ?? 30
+        let box = isCropped ? rect : CGRect(origin: .zero, size: videoSize)
+        let start = isTrimmed ? trimStart : 0
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-parts-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+
+        // One composition with just the picture; the sound is added at the end.
+        let mix = AVMutableComposition()
+        guard let vt = mix.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              (try? vt.insertTimeRange(trackRange, of: track, at: trackRange.start)) != nil else {
+            exportError = "couldn't prepare the video"; return nil
+        }
+        vt.preferredTransform = transform
+
+        func composition() -> AVMutableVideoComposition {
+            let comp = AVMutableVideoComposition()
+            comp.renderSize = box.size
+            comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(min(60, max(1, fps > 0 ? fps.rounded() : 30))))
+            let ins = AVMutableVideoCompositionInstruction()
+            ins.timeRange = CMTimeRange(start: .zero, duration: mix.duration)
+            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+            layer.setTransform(transform.concatenating(CGAffineTransform(translationX: -box.minX, y: -box.minY)), at: .zero)
+            ins.layerInstructions = [layer]
+            comp.instructions = [ins]
+            return comp
+        }
+
+        var sessions: [AVAssetExportSession] = []
+        var files: [URL] = []
+        let partLen = mediaLen / Double(parts)
+        for i in 0..<parts {
+            guard let ex = AVAssetExportSession(asset: mix, presetName: AVAssetExportPresetHighestQuality) else {
+                exportError = "export not available"; return nil
+            }
+            let file = work.appendingPathComponent("part\(i).mp4")
+            ex.outputURL = file
+            ex.outputFileType = .mp4
+            ex.videoComposition = composition()
+            let a = CMTime(seconds: start + Double(i) * partLen, preferredTimescale: 600)
+            let b = CMTime(seconds: i == parts - 1 ? start + mediaLen : start + Double(i + 1) * partLen, preferredTimescale: 600)
+            ex.timeRange = CMTimeRange(start: a, end: b)
+            sessions.append(ex); files.append(file)
+        }
+        partSessions = sessions
+        partsNote = ", \(parts) parts side by side"
+
+        let started = Date()
+        let poll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let p = sessions.map { Double($0.progress) }.reduce(0, +) / Double(sessions.count)
+                self?.progress = p * 0.97
+                let elapsed = Date().timeIntervalSince(started)
+                if p > 0.01, elapsed > 1 {
+                    let left = elapsed * (1 - p) / p
+                    self?.liveInfo = String(format: "%.1f×", p * mediaLen / elapsed) + " · \(sessions.count) parts · "
+                        + (left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left")
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for ex in sessions {
+                group.addTask { await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in ex.exportAsynchronously { c.resume() } } }
+            }
+        }
+        poll.cancel()
+        partSessions = []
+        if cancelled { return nil }
+        if let bad = sessions.first(where: { $0.status != .completed }) {
+            exportError = bad.error?.localizedDescription ?? "a part didn't finish"
+            return nil
+        }
+
+        // Join the parts without re-encoding, and take the sound from the original.
+        liveInfo = "joining parts…"
+        let list = work.appendingPathComponent("parts.txt")
+        try? files.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n")
+            .write(to: list, atomically: true, encoding: .utf8)
+        let out = outputURL(for: src, ext: "mp4")
+        var args = ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list.path]
+        if start > 0 { args += ["-ss", String(format: "%.3f", start)] }
+        args += ["-t", String(format: "%.3f", mediaLen), "-i", src.path,
+                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-shortest", "-movflags", "+faststart", out.path]
+        let code = await run(ff, args)
+        progress = 1
+        if code != 0 || cancelled {
+            exportError = "joining the parts failed"
+            try? FileManager.default.removeItem(at: out)
+            return nil
+        }
+        return out
     }
 
     private func saveFast(src: URL, ff: URL, rect: CGRect) async -> URL? {
