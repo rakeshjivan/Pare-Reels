@@ -10,6 +10,8 @@ final class Updater: ObservableObject {
 
     @Published private(set) var readyBuild: Int?
     @Published private(set) var downloading = false
+    @Published private(set) var checking = false
+    @Published private(set) var statusText: String?
 
     /// Build number baked in by GitHub (0 for builds made on your own Mac, which never auto-update).
     let currentBuild = Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0") ?? 0
@@ -24,20 +26,43 @@ final class Updater: ObservableObject {
         let assets: [Asset]
     }
 
-    func check() async {
-        guard currentBuild > 0, readyBuild == nil, !downloading else { return }
+    /// Manual "Check for Updates": same as the launch check, but says what happened.
+    func checkNow() async {
+        guard !checking, !downloading else { return }
+        if readyBuild != nil { install(relaunch: true); return }
+        guard currentBuild > 0 else {
+            statusText = "This copy was built on your Mac, so it doesn't auto-update."
+            return
+        }
+        checking = true
+        statusText = "Checking…"
+        let found = await check()
+        checking = false
+        switch found {
+        case .updated(let b): statusText = "Build \(b) downloaded. Click Restart to Update."
+        case .upToDate: statusText = "You're up to date (build \(currentBuild))."
+        case .failed: statusText = "Couldn't check right now. Try again later."
+        }
+    }
+
+    enum Result { case updated(Int), upToDate, failed }
+
+    @discardableResult
+    func check() async -> Result {
+        guard currentBuild > 0, readyBuild == nil, !downloading else { return readyBuild.map { .updated($0) } ?? .upToDate }
         var req = URLRequest(url: Self.latestAPI)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("PareReels/\(currentBuild)", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let release = try? JSONDecoder().decode(Release.self, from: data),
-              let latest = Int(release.tag_name.replacingOccurrences(of: "build-", with: "")),
-              latest > currentBuild,
-              let asset = release.assets.first(where: { $0.name.lowercased().hasSuffix("mac.zip") })
-        else { return }
+              let latest = Int(release.tag_name.replacingOccurrences(of: "build-", with: ""))
+        else { return .failed }
+        guard latest > currentBuild else { return .upToDate }
+        guard let asset = release.assets.first(where: { $0.name.lowercased().hasSuffix("mac.zip") }) else { return .failed }
 
         downloading = true
+        statusText = "Downloading build \(latest)…"
         defer { downloading = false }
         let fm = FileManager.default
         let work = fm.temporaryDirectory.appendingPathComponent("PareReelsUpdate-\(latest)")
@@ -51,12 +76,15 @@ final class Updater: ObservableObject {
                   let app = try fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
                     .first(where: { $0.pathExtension == "app" }),
                   Bundle(url: app)?.bundleIdentifier == Bundle.main.bundleIdentifier
-            else { return }
+            else { return .failed }
             _ = try? Tools.runQuick("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
             stagedApp = app
             readyBuild = latest
+            statusText = nil
+            return .updated(latest)
         } catch {
             try? fm.removeItem(at: work)
+            return .failed
         }
     }
 
@@ -109,6 +137,25 @@ struct UpdateBanner: View {
             .font(.callout)
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue.opacity(0.08)))
+        }
+    }
+}
+
+/// "Check for Updates" / "Restart to Update", with a one-line result next to it.
+struct UpdateButton: View {
+    @ObservedObject var updater = Updater.shared
+    let busy: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let t = updater.statusText {
+                Text(t).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if updater.checking || updater.downloading { ProgressView().controlSize(.small) }
+            Button(updater.readyBuild != nil ? "Restart to Update" : "Check for Updates") {
+                Task { await updater.checkNow() }
+            }
+            .disabled(busy || updater.checking || updater.downloading)
         }
     }
 }

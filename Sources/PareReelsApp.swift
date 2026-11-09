@@ -460,6 +460,16 @@ final class DownloadModel: ObservableObject {
         }
     }
 
+    /// Empties the link box and the list of downloads.
+    func clear() {
+        guard !isRunning else { return }
+        urlText = ""
+        items = []
+        notice = nil
+        needsFullDiskAccess = false
+        log = ""
+    }
+
     func cancel() {
         cancelRequested = true
         current?.terminate()
@@ -826,6 +836,9 @@ struct ContentView: View {
                         .keyboardShortcut(.defaultAction)
                         .controlSize(.large)
                         .disabled(!model.ready)
+                    Button("Clear") { model.clear() }
+                        .controlSize(.large)
+                        .disabled(model.urlText.isEmpty && model.items.isEmpty)
                 }
                 if let msg = model.setupMessage {
                     if !model.setupFailed { ProgressView().controlSize(.small) }
@@ -833,6 +846,8 @@ struct ContentView: View {
                     if model.setupFailed { Button("Retry") { Task { await model.setup() } } }
                 }
                 if let n = model.notice { Text(n).foregroundStyle(.orange) }
+                Spacer()
+                UpdateButton(busy: model.isRunning)
             }
 
             if model.ready && model.ffmpeg == nil {
