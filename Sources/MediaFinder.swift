@@ -33,6 +33,8 @@ enum MediaKind: Int, Comparable {
         func ends(_ exts: [String]) -> Bool { exts.contains { path.hasSuffix($0) } }
 
         if ends([".m3u8", ".mpd"]) || lower.contains(".m3u8") || lower.contains("format=m3u8") { return .manifest }
+        // Microsoft Teams / Stream (SharePoint) recordings: DASH stream behind a "videomanifest" link.
+        if path.hasSuffix("/videomanifest") || lower.contains("/videomanifest?") { return .manifest }
         if ends([".ts", ".m4s", ".cmfv", ".cmfa"]) { return .segment }
         // Byte-range pieces of a stream (Vimeo and others) are not whole files.
         if lower.contains("/range/") || lower.contains("range=") || lower.contains("bytes=") { return .segment }
@@ -134,7 +136,7 @@ final class MediaFinder: ObservableObject {
     (function(){
       if (window.__pareReels) return; window.__pareReels = true;
       var seen = {};
-      var re = /(\\.(m3u8|mpd|mp4|m4v|m4a|mov|webm|mkv|mp3|aac|opus|m4s|ts)([?#]|$))|m3u8|mime=(video|audio)/i;
+      var re = /(\\.(m3u8|mpd|mp4|m4v|m4a|mov|webm|mkv|mp3|aac|opus|m4s|ts)([?#]|$))|m3u8|videomanifest|mime=(video|audio)/i;
       function report(u){
         try { u = new URL(u, location.href).href; } catch(e) { return; }
         if (!/^https?:/i.test(u) || seen[u] || !re.test(u)) return;
