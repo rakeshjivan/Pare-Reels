@@ -401,7 +401,11 @@ final class CropModel: ObservableObject {
             a += ["-i", src.path]
             if trimIt { a += ["-t", String(format: "%.3f", length)] }
             a += ["-map", "0:v:0", "-map", "0:a?"]
-            if cropIt { a += ["-vf", filter] }
+            if cropIt {
+                // Change-only encoding: frames identical to the previous one (inside the crop) are not
+                // re-encoded; the previous frame just stays on screen longer. At least one frame per second is kept.
+                a += ["-vf", filter + ",mpdecimate=hi=256:lo=128:frac=0.1:max=30", "-fps_mode", "vfr"]
+            }
             return a + encoder + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path]
         }
         // Fastest first: hardware decode + hardware encode tuned for speed. Software only as a last resort.
