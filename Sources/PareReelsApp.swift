@@ -124,6 +124,13 @@ enum ItemStatus: Equatable {
     var isFinal: Bool { self == .done || self == .failed || self == .cancelled }
 }
 
+/// The rows still waiting in a batch; each download slot takes the next one.
+@MainActor final class BatchQueue {
+    private var rows: [Int]
+    init(_ rows: [Int]) { self.rows = rows }
+    func take() -> Int? { rows.isEmpty ? nil : rows.removeFirst() }
+}
+
 struct DownloadItem: Identifiable {
     let id = UUID()
     let url: String
@@ -301,9 +308,11 @@ final class DownloadModel: ObservableObject {
     @Published var log = ""
     @Published var notice: String?
 
-    private var current: Process?
+    private var running: [Int: Process] = [:]   // downloads in progress, by row
     private var cancelRequested = false
-    private var partsDir: URL?   // this download's unfinished pieces
+    /// How many videos in a batch download at the same time.
+    private static let batchAtOnce = 3
+    private var sharing = false   // more than one video downloading at once
     private var lastErrors: [Int: String] = [:]
     private var lastFiles: [Int: String] = [:]
     private var autoBrowserUsed: BrowserLogin?
@@ -415,17 +424,29 @@ final class DownloadModel: ObservableObject {
         isRunning = true
         cancelRequested = false
         Task {
+            var queue: [Int] = []
             for i in items.indices {
-                if cancelRequested { items[i].status = .cancelled; continue }
                 if Self.needsFinder(items[i].url) {
                     items[i].needsFinder = true
                     items[i].detail = "Finding the video on the page…"
-                    continue
+                } else {
+                    queue.append(i)
                 }
-                await download(index: i)
+            }
+            sharing = queue.count > 1
+            // Several videos at once: each one on its own is limited by the site, not your connection.
+            let line = BatchQueue(queue)
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<min(Self.batchAtOnce, queue.count) {
+                    group.addTask { @MainActor [self] in
+                        while let i = line.take() {
+                            if cancelRequested { items[i].status = .cancelled; continue }
+                            await download(index: i)
+                        }
+                    }
+                }
             }
             isRunning = false
-            current = nil
             promptNext()
         }
     }
@@ -448,10 +469,10 @@ final class DownloadModel: ObservableObject {
         items[i].status = .waiting
         isRunning = true
         cancelRequested = false
+        sharing = false
         Task {
             await download(index: i)
             isRunning = false
-            current = nil
             promptNext()
         }
     }
@@ -496,10 +517,10 @@ final class DownloadModel: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         cancelRequested = false
+        sharing = false
         Task {
             await download(index: i)
             isRunning = false
-            current = nil
             promptNext()
         }
     }
@@ -522,10 +543,12 @@ final class DownloadModel: ObservableObject {
 
     func cancel() {
         cancelRequested = true
-        current?.terminate()
+        for p in running.values { p.terminate() }
     }
 
-    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true, loginOverride: BrowserLogin? = nil, pieces: Int = 32) -> [String] {
+    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true, loginOverride: BrowserLogin? = nil, gentle: Bool = false) -> [String] {
+        // 32 pieces on its own; when several videos share the connection, fewer each.
+        let pieces = (sharing ? 16 : 32) / (gentle ? 2 : 1)
         let url = item.url
         var a = [
             "--newline", "--color", "never", "--no-playlist",
@@ -536,7 +559,7 @@ final class DownloadModel: ObservableObject {
             "--print", "before_dl:TITLE %(title)s", "--no-simulate",
             "--progress",   // --print switches on quiet mode, which hides progress unless asked for
         ]
-        if let parts = partsDir { a += ["-P", "temp:\(parts.path)"] }
+        a += ["-P", "temp:\(Self.partsDir(for: item.id).path)"]
         // YouTube serves each file as one slow, rate-limited stream. Asking for it as many small
         // pieces lets 32 of them download at once (16 if YouTube pushes back).
         // A refused piece must stop the download, never be silently left out of the file.
@@ -575,18 +598,20 @@ final class DownloadModel: ObservableObject {
         return a
     }
 
+    static func partsDir(for id: UUID) -> URL {
+        Tools.partsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
     private func download(index i: Int) async {
         items[i].status = .downloading
         items[i].detail = "Starting…"
         appendLog("▶︎ \(items[i].url)")
         lastErrors[i] = nil
-        let parts = Tools.partsRoot.appendingPathComponent(items[i].id.uuidString, isDirectory: true)
+        let parts = Self.partsDir(for: items[i].id)
         try? FileManager.default.createDirectory(at: parts, withIntermediateDirectories: true)
-        partsDir = parts
         // Finished, failed or cancelled: unfinished pieces never stay behind.
         defer {
             try? FileManager.default.removeItem(at: parts)
-            if partsDir == parts { partsDir = nil }
         }
 
         var ok: Bool
@@ -600,10 +625,10 @@ final class DownloadModel: ObservableObject {
             // YouTube refused some of the 32 pieces: carry on with 16 (finished pieces are kept).
             if !ok, !cancelRequested, Self.host(items[i].url, in: Self.youtubeHosts),
                !isAuthError(lastErrors[i] ?? "") {
-                appendLog("YouTube pushed back: continuing with 16 pieces at once…")
+                appendLog("YouTube pushed back: continuing with fewer pieces at once…")
                 lastErrors[i] = nil
                 items[i].detail = "Continuing more gently…"
-                ok = await runYtdlp(arguments(for: items[i], pieces: 16), index: i) == 0
+                ok = await runYtdlp(arguments(for: items[i], gentle: true), index: i) == 0
             }
             // Automatic: the site wants a login, so try again with your usual browser's login.
             if !ok, !cancelRequested, browser == .auto, isAuthError(lastErrors[i] ?? "") {
@@ -619,7 +644,7 @@ final class DownloadModel: ObservableObject {
                 appendLog("Retrying without the browser login…")
                 lastErrors[i] = nil
                 items[i].detail = "Retrying…"
-                ok = await runYtdlp(arguments(for: items[i], useBrowserLogin: false, pieces: 16), index: i) == 0
+                ok = await runYtdlp(arguments(for: items[i], useBrowserLogin: false, gentle: true), index: i) == 0
             }
         }
 
@@ -670,7 +695,8 @@ final class DownloadModel: ObservableObject {
                 let d = h.availableData
                 if d.isEmpty { h.readabilityHandler = nil } else { splitter.feed(d) }
             }
-            p.terminationHandler = { proc in
+            p.terminationHandler = { [weak self] proc in
+                Task { @MainActor in if self?.running[i] === proc { self?.running[i] = nil } }
                 pipe.fileHandleForReading.readabilityHandler = nil
                 splitter.feed(pipe.fileHandleForReading.readDataToEndOfFile())
                 splitter.flush()
@@ -678,7 +704,7 @@ final class DownloadModel: ObservableObject {
             }
             do {
                 try p.run()
-                current = p
+                running[i] = p
             } catch {
                 appendLog("Could not start yt-dlp: \(error.localizedDescription)")
                 cont.resume(returning: -1)
@@ -691,8 +717,9 @@ final class DownloadModel: ObservableObject {
     private static let progressTemplate = "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"
 
     /// `intoParts`: the result is an in-between file (picture or sound on its own), so keep it with the pieces.
-    private func directArgs(_ job: DirectJob, output: String, intoParts: Bool = false) -> [String] {
-        let home = intoParts ? (partsDir ?? folder) : folder
+    private func directArgs(_ job: DirectJob, id: UUID, output: String, intoParts: Bool = false) -> [String] {
+        let parts = Self.partsDir(for: id)
+        let home = intoParts ? parts : folder
         var a = [
             "--newline", "--color", "never", "--no-playlist",
             "-N", "8",   // fetch streamed videos in 8 pieces at once
@@ -704,7 +731,7 @@ final class DownloadModel: ObservableObject {
             "--add-header", "User-Agent:\(job.userAgent)",
             "--cookies", job.cookiesFile.path,
         ]
-        if let parts = partsDir { a += ["-P", "temp:\(parts.path)"] }
+        a += ["-P", "temp:\(parts.path)"]
         if let ff = ffmpeg { a += ["--ffmpeg-location", ff.deletingLastPathComponent().path] }
         return a
     }
@@ -716,7 +743,7 @@ final class DownloadModel: ObservableObject {
 
         // A stream link (m3u8/mpd) already describes picture + sound; the downloader joins them.
         if job.primaryIsManifest {
-            var a = directArgs(job, output: "\(template).%(ext)s")
+            var a = directArgs(job, id: items[i].id, output: "\(template).%(ext)s")
             if ffmpeg != nil {
                 if quality == .audio {
                     a += ["-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
@@ -730,7 +757,7 @@ final class DownloadModel: ObservableObject {
 
         // A whole file: download it, then check it has sound.
         lastFiles[i] = nil
-        guard await runYtdlp(directArgs(job, output: "\(template).part-video.%(ext)s", intoParts: true) + ["--", job.primary], index: i) == 0,
+        guard await runYtdlp(directArgs(job, id: items[i].id, output: "\(template).part-video.%(ext)s", intoParts: true) + ["--", job.primary], index: i) == 0,
               let videoPath = lastFiles[i] else { return (false, "") }
 
         guard let ff = ffmpeg, let probe = Tools.find("ffprobe") else {
@@ -750,7 +777,7 @@ final class DownloadModel: ObservableObject {
             n += 1
             items[i].detail = "Getting the sound…"
             lastFiles[i] = nil
-            guard await runYtdlp(directArgs(job, output: "\(template).part-sound\(n).%(ext)s", intoParts: true) + ["--", candidate], index: i) == 0,
+            guard await runYtdlp(directArgs(job, id: items[i].id, output: "\(template).part-sound\(n).%(ext)s", intoParts: true) + ["--", candidate], index: i) == 0,
                   let soundPath = lastFiles[i] else { continue }
             let s = await Self.streams(soundPath, probe: probe)
             guard s.contains("audio"), !s.contains("video") else {
