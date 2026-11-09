@@ -49,7 +49,7 @@ final class Updater: ObservableObject {
 
     @discardableResult
     func check() async -> Result {
-        guard currentBuild > 0, readyBuild == nil, !downloading else { return readyBuild.map { .updated($0) } ?? .upToDate }
+        guard currentBuild > 0, readyBuild == nil, !downloading else { return readyBuild.map { Result.updated($0) } ?? Result.upToDate }
         var req = URLRequest(url: Self.latestAPI)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("PareReels/\(currentBuild)", forHTTPHeaderField: "User-Agent")
