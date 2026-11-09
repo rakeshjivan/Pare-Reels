@@ -548,8 +548,8 @@ final class DownloadModel: ObservableObject {
             let err = lastErrors[i] ?? "The download didn't finish. See the log."
             items[i].status = .failed
             let c = items[i].credentials
-            let triedLogin = browser != .none || !c.videoPassword.isEmpty || !c.username.isEmpty
-            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err) || (isAuthError(err) && !triedLogin)) {
+            let typedCredentials = !c.videoPassword.isEmpty || !c.username.isEmpty
+            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err) || (isAuthError(err) && !typedCredentials)) {
                 // The downloader can't get it on its own (e.g. Vimeo now wants a login):
                 // play the page in the finder window and take the file from there.
                 // The downloader can't read this page: look for the file on the page instead.
