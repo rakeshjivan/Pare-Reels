@@ -32,6 +32,9 @@ jobs:
         run: |
           pip3 install --break-system-packages -q pillow numpy 2>/dev/null || pip3 install -q pillow numpy
           python3 compare.py | tee match.txt
-          while IFS= read -r l; do echo "::notice title=av::${l}"; done < <(grep RESULT av.txt)
-          while IFS= read -r l; do echo "::notice title=web::${l}"; done < <(grep RESULT web.txt)
-          while IFS= read -r l; do echo "::notice title=match::${l}"; done < match.txt
+          python3 - <<'PY'
+          for name in ['av.txt','web.txt','match.txt']:
+              lines=[l.strip() for l in open(name) if l.strip() and ('RESULT' in l or 'MATCH' in l)]
+              for i in range(0,len(lines),6):
+                  print('::notice title=%s %d::%s' % (name, i//6, '%0A'.join(x.replace('%','%25') for x in lines[i:i+6])))
+          PY
