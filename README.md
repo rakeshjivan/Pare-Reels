@@ -9,6 +9,9 @@ The app isn't signed by Apple, so the first time you open it macOS blocks it. Go
 
 **Or build it yourself** (no Gatekeeper warning): in Terminal, run `bash build.sh` in this folder. If Apple's Command Line Tools aren't installed, the script prompts you to install them.
 
+## Updates
+Pare Reels checks for a newer version each time it opens. It downloads the update in the background and installs it when you quit. Click **Restart Now** in the banner to update straight away. Copies you build yourself with `build.sh` don't auto-update.
+
 ## Publish a new version
 Every change pushed to `main` builds the app and publishes it as the latest release automatically.
 

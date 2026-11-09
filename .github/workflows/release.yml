@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build universal app
-        run: UNIVERSAL=1 bash build.sh
+        run: UNIVERSAL=1 BUILD_NUMBER=${{ github.run_number }} bash build.sh
       - name: Zip
         run: ditto -c -k --keepParent "Pare Reels.app" Pare-Reels-mac.zip
       - name: Keep build as artifact

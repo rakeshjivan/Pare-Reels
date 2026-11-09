@@ -17,7 +17,10 @@ struct PareReelsApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 580, minHeight: 560)
-                .task { await model.setup() }
+                .task {
+                    await model.setup()
+                    await Updater.shared.check()
+                }
         }
         .windowResizability(.contentMinSize)
     }
@@ -25,6 +28,11 @@ struct PareReelsApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // A downloaded update is swapped in as the app quits.
+    func applicationWillTerminate(_ notification: Notification) {
+        Updater.shared.install(relaunch: false)
+    }
 }
 
 // MARK: - Quality
@@ -764,6 +772,8 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            UpdateBanner(busy: model.isRunning)
+
             Text("Paste one or more links (one per line)")
                 .font(.headline)
 
@@ -843,7 +853,7 @@ struct ContentView: View {
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .frame(minHeight: 140)
 
-            DisclosureGroup("Log") {
+            DisclosureGroup("Log\(Updater.shared.currentBuild > 0 ? "  ·  build \(Updater.shared.currentBuild)" : "")") {
                 ScrollView {
                     Text(model.log)
                         .font(.system(size: 11, design: .monospaced))
