@@ -61,6 +61,10 @@ final class CropModel: ObservableObject {
     @Published var busy = false
     @Published var progress: Double?
     @Published var liveInfo: String?          // e.g. "14× · about 8 min left"
+    enum Engine: String, CaseIterable, Identifiable { case apple = "Apple", ffmpeg = "ffmpeg"; var id: String { rawValue } }
+    @Published var engine: Engine = .apple    // testing switch: which pipeline Save uses
+    private var exportSession: AVAssetExportSession?
+    private var exportError: String?
     private var fastEncoder = ""
     @Published var status: String?
     @Published var savedFile: URL?
@@ -202,6 +206,7 @@ final class CropModel: ObservableObject {
     func cancel() {
         cancelled = true
         process?.terminate()
+        exportSession?.cancelExport()
         if method == .secure { secure.cancel() }
     }
 
@@ -246,8 +251,14 @@ final class CropModel: ObservableObject {
             switch how {
             case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
             case .fast:
-                result = await saveFast(src: src, ff: ff, rect: rect)
-                note = " Encoder: \(fastEncoder)."
+                if engine == .apple, let r = await saveApple(src: src, rect: rect) {
+                    result = r
+                    note = " Engine: Apple."
+                } else if !cancelled {
+                    if engine == .apple { note = " Apple engine failed (\(exportError ?? "unknown")), so ffmpeg was used." }
+                    result = await saveFast(src: src, ff: ff, rect: rect)
+                    note += " Engine: ffmpeg, \(fastEncoder)."
+                }
             case .secure:
                 let out = outputURL(for: src, ext: "mp4")
                 secure.onProgress = { [weak self] p in self?.progress = p }
@@ -272,7 +283,9 @@ final class CropModel: ObservableObject {
             } else if let out = result {
                 savedFile = out
                 let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
-                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs)) · \(String(format: "%.0f", mb)) MB.\(note)"
+                let media = isTrimmed ? trimEnd - trimStart : duration
+                let speed = secs > 0 ? String(format: " · %.1f× real time", media / secs) : ""
+                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB.\(note)"
             } else {
                 status = how == .secure ? "Secure save failed: \(note)"
                     : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
@@ -314,6 +327,63 @@ final class CropModel: ObservableObject {
         args += ["-movflags", "+faststart", out.path]
         guard await run(ff, args) == 0, !cancelled else { try? FileManager.default.removeItem(at: out); return nil }
         return out
+    }
+
+    /// Apple's export pipeline (what Photos uses): decode, crop and encode all stay on the video hardware.
+    private func saveApple(src: URL, rect: CGRect) async -> URL? {
+        exportError = nil
+        let asset = AVURLAsset(url: src)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let transform = try? await track.load(.preferredTransform) else { exportError = "no video track"; return nil }
+        let fps = (try? await track.load(.nominalFrameRate)) ?? 30
+        let total = (try? await asset.load(.duration)) ?? CMTime(seconds: duration, preferredTimescale: 600)
+        let range = isTrimmed
+            ? CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600), end: CMTime(seconds: trimEnd, preferredTimescale: 600))
+            : CMTimeRange(start: .zero, duration: total)
+        let box = isCropped ? rect : CGRect(origin: .zero, size: videoSize)
+
+        let comp = AVMutableVideoComposition()
+        comp.renderSize = box.size
+        comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(min(60, max(1, fps > 0 ? fps.rounded() : 30))))
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: total)
+        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+        layer.setTransform(transform.concatenating(CGAffineTransform(translationX: -box.minX, y: -box.minY)), at: .zero)
+        instruction.layerInstructions = [layer]
+        comp.instructions = [instruction]
+
+        guard let ex = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+            exportError = "export not available"; return nil
+        }
+        let out = outputURL(for: src, ext: "mp4")
+        ex.outputURL = out
+        ex.outputFileType = .mp4
+        ex.videoComposition = comp
+        ex.timeRange = range
+        ex.shouldOptimizeForNetworkUse = true
+        exportSession = ex
+
+        let started = Date(), mediaLen = range.duration.seconds
+        let poll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let p = Double(ex.progress)
+                self?.progress = p
+                let elapsed = Date().timeIntervalSince(started)
+                if p > 0.01, elapsed > 1 {
+                    let speed = p * mediaLen / elapsed
+                    let left = elapsed * (1 - p) / p
+                    self?.liveInfo = String(format: "%.1f×", speed) + " · " + (left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left")
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in ex.exportAsynchronously { c.resume() } }
+        poll.cancel()
+        exportSession = nil
+        if ex.status == .completed { return out }
+        exportError = ex.error?.localizedDescription ?? "status \(ex.status.rawValue)"
+        try? FileManager.default.removeItem(at: out)
+        return nil
     }
 
     private func saveFast(src: URL, ff: URL, rect: CGRect) async -> URL? {
@@ -462,6 +532,12 @@ struct CropView: View {
                         }
                         Button("Cancel") { model.cancel() }
                     } else {
+                        Picker("Engine (testing)", selection: $model.engine) {
+                            ForEach(CropModel.Engine.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 230)
+                        .help("Temporary: compare Apple's pipeline with ffmpeg on the same video, then we keep the faster one.")
                         Button("Save") { model.save(.fast) }
                             .keyboardShortcut(.defaultAction)
                             .help("Rebuilds the video with your Mac's video hardware: the cropped area is permanently removed and trims are exact.")
