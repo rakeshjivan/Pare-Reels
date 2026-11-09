@@ -1,0 +1,37 @@
+name: Crop lab (Apple engine test)
+on:
+  push:
+    branches: [croplab]
+jobs:
+  lab:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get ffmpeg
+        working-directory: lab
+        run: |
+          curl -sSL -o ff.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" && unzip -o -q ff.zip && chmod +x ffmpeg
+          ./ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=3" -c:v libx264 -pix_fmt yuv420p src.mp4
+      - name: Make variants
+        working-directory: lab
+        run: |
+          node variants.mjs
+          ./ffmpeg -loglevel error -y -i src.mp4 -c copy -bsf:v "h264_metadata=crop_left=400:crop_right=440:crop_top=200:crop_bottom=228" s1.mp4
+          ./ffmpeg -loglevel error -y -i s1.mp4 -c copy -movflags +faststart E_ffmpeg_twopass.mp4
+          ls -la *.mp4
+      - name: AVFoundation (QuickTime/Photos engine)
+        working-directory: lab
+        run: swift avcheck.swift A_sps.mp4 B_clap_cropdims.mp4 C_clap_origdims.mp4 D_both.mp4 E_ffmpeg_twopass.mp4 Z_topleft_control.mp4 | tee av.txt
+      - name: Safari engine (WebKit) and Chromium
+        working-directory: lab
+        run: |
+          npm init -y >/dev/null && npm i playwright@1 >/dev/null 2>&1 && npx playwright install webkit chromium >/dev/null 2>&1
+          node webcheck.mjs A_sps.mp4 B_clap_cropdims.mp4 C_clap_origdims.mp4 D_both.mp4 E_ffmpeg_twopass.mp4 Z_topleft_control.mp4 | tee web.txt
+      - name: Compare
+        working-directory: lab
+        run: |
+          pip3 install --break-system-packages -q pillow numpy 2>/dev/null || pip3 install -q pillow numpy
+          python3 compare.py | tee match.txt
+          while IFS= read -r l; do echo "::notice title=av::${l}"; done < <(grep RESULT av.txt)
+          while IFS= read -r l; do echo "::notice title=web::${l}"; done < <(grep RESULT web.txt)
+          while IFS= read -r l; do echo "::notice title=match::${l}"; done < match.txt
