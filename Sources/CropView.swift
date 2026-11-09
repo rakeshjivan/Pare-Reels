@@ -258,8 +258,8 @@ final class CropModel: ObservableObject {
             case .fast where compress:
                 // Smallest file that still looks the same: test a few quality levels on samples,
                 // then encode in HEVC with change-only encoding, pieces shared out to the workers.
-                let pick = await pickQuality(src: src, ff: ff, rect: rect)
-                if cancelled { break }
+                compressRefusal = nil
+                guard let pick = await pickQuality(src: src, ff: ff, rect: rect), !cancelled else { break }
                 let enc = ["-c:v", "hevc_videotoolbox", "-q:v", "\(pick.q)", "-tag:v", "hvc1"]
                 if let r = await saveParallel(src: src, ff: ff, rect: rect, encoder: enc, audio: "128k") {
                     result = r
@@ -303,6 +303,12 @@ final class CropModel: ObservableObject {
             liveInfo = nil
             if cancelled {
                 status = "Cancelled."
+            } else if compress, let out = result,
+                      let inB = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.int64Value,
+                      let outB = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value,
+                      outB >= inB, !isCropped, !isTrimmed {
+                try? FileManager.default.removeItem(at: out)
+                status = "The compressed file came out no smaller than the original, so it was discarded. This video is already compressed about as far as it can go."
             } else if let out = result {
                 savedFile = out
                 let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
@@ -314,7 +320,8 @@ final class CropModel: ObservableObject {
                 }
                 status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB\(smaller).\(note)"
             } else {
-                status = how == .secure ? "Secure save failed: \(note)"
+                status = compress && compressRefusal != nil ? compressRefusal
+                    : how == .secure ? "Secure save failed: \(note)"
                     : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
             }
         }
@@ -473,7 +480,9 @@ final class CropModel: ObservableObject {
     /// Finds the lowest HEVC quality setting whose result still looks the same as the original.
     /// Short samples from the start, middle and end are encoded at a few settings and scored with
     /// VMAF (Netflix's measure; 95+ looks the same to most viewers), or SSIM if VMAF isn't available.
-    private func pickQuality(src: URL, ff: URL, rect: CGRect) async -> (q: Int, label: String) {
+    /// Returns nil (with the reason in `compressRefusal`) when the video can't get smaller without visible loss.
+    private var compressRefusal: String?
+    private func pickQuality(src: URL, ff: URL, rect: CGRect) async -> (q: Int, label: String)? {
         let mediaLen = isTrimmed ? trimEnd - trimStart : duration
         let start = isTrimmed ? trimStart : 0
         let sampleLen = min(8.0, mediaLen)
@@ -486,8 +495,8 @@ final class CropModel: ObservableObject {
         let vmaf = (await runForLogOut(ff, ["-hide_banner", "-filters"])).contains("libvmaf")
 
         // Score one quality setting: the worst of the samples.
-        func score(_ q: Int) async -> Double {
-            await withTaskGroup(of: Double.self) { group in
+        func score(_ q: Int) async -> (Double, Double) {
+            await withTaskGroup(of: (Double, Double).self) { group in
                 for (i, a) in at.enumerated() {
                     group.addTask {
                         let out = work.appendingPathComponent("q\(q)-\(i).mp4")
@@ -501,26 +510,39 @@ final class CropModel: ObservableObject {
                         let metric = vmaf ? "libvmaf=n_threads=4:n_subsample=2" : "ssim"
                         let log = await self.runForLog(ff, ["-hide_banner", "-nostats", "-i", out.path, "-ss", ss, "-t", len, "-i", src.path,
                             "-lavfi", "[0:v]setpts=PTS-STARTPTS[d];[1:v]\(ref)[r];[d][r]\(metric)", "-f", "null", "-"])
-                        return Self.parseScore(log, vmaf: vmaf)
+                        let bytes = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.doubleValue ?? 0
+                        return (Self.parseScore(log, vmaf: vmaf), bytes)
                     }
                 }
-                var worst = Double.infinity
-                for await v in group { worst = min(worst, v) }
-                return worst == .infinity ? 0 : worst
+                var worst = Double.infinity, bytes = 0.0
+                for await (v, b) in group { worst = min(worst, v); bytes += b }
+                return (worst == .infinity ? 0 : worst, bytes)
             }
         }
+        // The original's bit rate, for judging whether the result would actually be smaller.
+        let fileBytes = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.doubleValue ?? 0
+        let sourceRate = duration > 0 ? fileBytes * 8 / duration : 0
         let target = vmaf ? 95.0 : 0.985
         let levels = [45, 52, 59, 66, 73]
-        var lo = 0, hi = levels.count - 1, best: (Int, Double)? = nil, tests = 0
+        var lo = 0, hi = levels.count - 1, best: (Int, Double, Double)? = nil, tests = 0
         while lo <= hi, !cancelled {          // binary search for the lowest setting that passes
             let mid = (lo + hi) / 2
             tests += 1
             liveInfo = "finding the smallest size that still looks the same (test \(tests))…"
-            let v = await score(levels[mid])
-            if v >= target { best = (levels[mid], v); hi = mid - 1 } else { lo = mid + 1 }
+            let (v, bytes) = await score(levels[mid])
+            if v >= target { best = (levels[mid], v, bytes); hi = mid - 1 } else { lo = mid + 1 }
         }
         liveInfo = nil
-        guard let b = best else { return (80, "high (no tested setting reached the target)") }
+        guard let b = best else {
+            compressRefusal = "This video is already compressed about as far as it can go: even the highest quality setting tested didn't look the same as the original, so no file was made."
+            return nil
+        }
+        // Would it actually be smaller? (Samples are a fair guide; change-only encoding usually saves a bit more.)
+        let sampleRate = b.2 * 8 / (sampleLen * Double(at.count))
+        if sourceRate > 0, sampleRate > sourceRate * 0.9 {
+            compressRefusal = String(format: "This video is already compressed about as far as it can go: keeping it looking the same would need about %.1f Mbps, and the original is only %.1f Mbps. No file was made, so nothing changed.", sampleRate / 1e6, sourceRate / 1e6)
+            return nil
+        }
         return (b.0, vmaf ? String(format: "VMAF %.1f, looks the same", b.1) : String(format: "SSIM %.3f", b.1))
     }
 
