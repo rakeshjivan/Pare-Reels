@@ -9,6 +9,13 @@ The app isn't signed by Apple, so the first time you open it macOS blocks it. Go
 
 **Or build it yourself** (no Gatekeeper warning): in Terminal, run `bash build.sh` in this folder. If Apple's Command Line Tools aren't installed, the script prompts you to install them.
 
+## Crop a video
+Open the **Crop** tab, then drop in a video or click **Open Video…**. Drag the handles or the box, or pick a shape (16:9, 1:1, 9:16, 4:5, 4:3). Use the slider to check the crop works for the whole video.
+- **Save — Instant** leaves the picture data untouched, so there's no quality loss and an hour-long video saves in seconds. It works with H.264 and HEVC videos (almost all MP4/MOV files). A few older editing apps may ignore the crop.
+- **Save — Fast** re-encodes with your Mac's video hardware. It works everywhere and makes a smaller file, and takes a few minutes for an hour of 1080p.
+
+The cropped copy is saved next to the original as "… (cropped)".
+
 ## Updates
 Pare Reels checks for a newer version each time it opens. It downloads the update in the background and installs it when you quit. Click **Restart Now** in the banner to update straight away. Copies you build yourself with `build.sh` don't auto-update.
 

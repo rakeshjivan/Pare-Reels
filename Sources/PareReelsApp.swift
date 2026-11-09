@@ -14,9 +14,14 @@ struct PareReelsApp: App {
 
     var body: some Scene {
         WindowGroup("Pare Reels") {
-            ContentView()
+            TabView {
+                ContentView()
+                    .tabItem { Label("Download", systemImage: "arrow.down.circle") }
+                CropView()
+                    .tabItem { Label("Crop", systemImage: "crop") }
+            }
                 .environmentObject(model)
-                .frame(minWidth: 580, minHeight: 560)
+                .frame(minWidth: 720, minHeight: 640)
                 .task {
                     await model.setup()
                     await Updater.shared.check()
