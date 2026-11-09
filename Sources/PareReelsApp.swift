@@ -528,7 +528,13 @@ final class DownloadModel: ObservableObject {
             "-o", "%(title).100B [%(id)s].%(ext)s", "--trim-filenames", "180",  // Facebook/Instagram titles are whole posts
             "--progress-template", "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
             "--print", "before_dl:TITLE %(title)s", "--no-simulate",
+            "--progress",   // --print switches on quiet mode, which hides progress unless asked for
         ]
+        // YouTube serves each file as one slow, rate-limited stream. Asking for it as many small
+        // pieces lets 16 of them download at once.
+        if Self.host(url, in: Self.youtubeHosts) {
+            a += ["--extractor-args", "youtube:formats=dashy", "-N", "16"]
+        }
         if let ff = ffmpeg {
             a += ["--ffmpeg-location", ff.deletingLastPathComponent().path]
             if quality == .audio {
@@ -666,6 +672,7 @@ final class DownloadModel: ObservableObject {
             "-P", folder.path, "-o", output,
             "--progress-template", Self.progressTemplate,
             "--print", "after_move:FILE %(filepath)s", "--no-simulate",
+            "--progress",
             "--referer", job.referer,
             "--add-header", "User-Agent:\(job.userAgent)",
             "--cookies", job.cookiesFile.path,
