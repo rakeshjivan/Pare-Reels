@@ -197,7 +197,7 @@ final class CropModel: ObservableObject {
 
     enum SaveMethod: String { case instant = "instant", fast = "fast", secure = "secure" }
     private var method: SaveMethod = .instant
-    let secure = SecureSaver()
+    lazy var secure = SecureSaver()   // browser engine, kept for testing the Pare web tool (not shown)
 
     func cancel() {
         cancelled = true
@@ -218,14 +218,14 @@ final class CropModel: ObservableObject {
         if !FileManager.default.isWritableFile(atPath: dir.path) {
             dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
-        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix), \(method.rawValue))"
+        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix))"
         return DownloadModel.uniqueURL(in: dir, name: base, ext: ext)
     }
 
     func save(_ how: SaveMethod) {
         let instant = how == .instant
         guard let src = url, !busy else { return }
-        guard isCropped || isTrimmed || !instant else {
+        guard isCropped || isTrimmed else {
             status = "Nothing to change yet. Drag the crop handles or set a start or end point."
             return
         }
@@ -237,7 +237,7 @@ final class CropModel: ObservableObject {
         liveInfo = nil
         busy = true; cancelled = false; savedFile = nil
         progress = instant ? nil : 0
-        status = ["instant": "Saving (instant)…", "fast": "Saving (fast, Mac hardware)…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
+        status = ["instant": "Saving (instant)…", "fast": "Saving…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
         let rect = pixelRect
         let started = Date()
         Task {
@@ -445,10 +445,8 @@ struct CropView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                if model.isTrimmed {
-                    Text("Instant cuts start at the nearest keyframe, so they may begin up to a few seconds early. Use Fast for an exact cut.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                Text("Saving permanently removes the cropped-out area and cuts exactly at your start and end points.")
+                    .font(.caption).foregroundStyle(.secondary)
 
                 HStack(spacing: 12) {
                     let r = model.pixelRect
@@ -464,16 +462,9 @@ struct CropView: View {
                         }
                         Button("Cancel") { model.cancel() }
                     } else {
-                        Button("Save — Secure") { model.save(.secure) }
-                            .help("Runs the Pare PDF browser engine on this Mac: re-encodes, removes cropped edges permanently, exact trims. For timing the website version.")
-                        Button("Save — Fast") { model.save(.fast) }
-                            .help("Re-encodes with your Mac's video hardware. Works everywhere, smaller file. A few minutes for an hour of video.")
-                        Button("Save — Instant") { model.save(.instant) }
+                        Button("Save") { model.save(.fast) }
                             .keyboardShortcut(.defaultAction)
-                            .disabled(!model.canInstant)
-                            .help(model.canInstant
-                                  ? "No re-encoding: done in seconds with no quality loss."
-                                  : "Instant crop isn't available for this video (rotated, or not H.264/HEVC). Use Fast.")
+                            .help("Rebuilds the video with your Mac's video hardware: the cropped area is permanently removed and trims are exact.")
                     }
                 }
                 .controlSize(.large)
@@ -490,7 +481,6 @@ struct CropView: View {
             }
         }
         .padding(20)
-        .background(alignment: .bottomLeading) { SecureHost(saver: model.secure).frame(width: 2, height: 2).opacity(0.02) }
     }
 
     private func timeString(_ s: Double) -> String {
