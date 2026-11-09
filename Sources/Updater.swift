@@ -47,19 +47,35 @@ final class Updater: ObservableObject {
 
     enum Result { case updated(Int), upToDate, failed }
 
+    private static func latestBuild() async -> Int? {
+        var req = URLRequest(url: releasesPage)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 20
+        if let (_, resp) = try? await URLSession.shared.data(for: req),
+           let http = resp as? HTTPURLResponse, http.statusCode == 200,
+           let tag = http.url?.lastPathComponent, tag.hasPrefix("build-"),
+           let n = Int(tag.dropFirst(6)) {
+            return n
+        }
+        // Fallback: GitHub's API.
+        var api = URLRequest(url: latestAPI)
+        api.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        api.setValue("PareReels", forHTTPHeaderField: "User-Agent")
+        api.timeoutInterval = 20
+        guard let (data, resp) = try? await URLSession.shared.data(for: api),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let release = try? JSONDecoder().decode(Release.self, from: data) else { return nil }
+        return Int(release.tag_name.replacingOccurrences(of: "build-", with: ""))
+    }
+
     @discardableResult
     func check() async -> Result {
         guard currentBuild > 0, readyBuild == nil, !downloading else { return readyBuild.map { Result.updated($0) } ?? Result.upToDate }
-        var req = URLRequest(url: Self.latestAPI)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("PareReels/\(currentBuild)", forHTTPHeaderField: "User-Agent")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let release = try? JSONDecoder().decode(Release.self, from: data),
-              let latest = Int(release.tag_name.replacingOccurrences(of: "build-", with: ""))
-        else { return .failed }
+        // Ask github.com which release is newest: it redirects .../releases/latest to .../tag/build-N.
+        // (Unlike GitHub's API, this isn't limited to 60 checks an hour.)
+        guard let latest = await Self.latestBuild() else { return .failed }
         guard latest > currentBuild else { return .upToDate }
-        guard let asset = release.assets.first(where: { $0.name.lowercased().hasSuffix("mac.zip") }) else { return .failed }
+        let assetURL = "https://github.com/rakeshjivan/Pare-Reels/releases/download/build-\(latest)/Pare-Reels-mac.zip"
 
         downloading = true
         statusText = "Downloading build \(latest)…"
@@ -70,7 +86,7 @@ final class Updater: ObservableObject {
             try? fm.removeItem(at: work)
             try fm.createDirectory(at: work, withIntermediateDirectories: true)
             let zip = work.appendingPathComponent("update.zip")
-            try await Tools.download(asset.browser_download_url, to: zip)
+            try await Tools.download(assetURL, to: zip)
             let status = await Task.detached { (try? Tools.runQuick("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])) ?? -1 }.value
             guard status == 0,
                   let app = try fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
