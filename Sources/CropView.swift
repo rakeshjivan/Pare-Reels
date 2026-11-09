@@ -248,6 +248,10 @@ final class CropModel: ObservableObject {
             var result: URL?
             switch how {
             case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
+            case .fast where !isCropped:
+                // Trim only: no rebuild needed — instant, works in every player.
+                result = await saveInstant(src: src, ff: ff, rect: rect)
+                note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
             case .fast:
                 if let r = await saveApple(src: src, rect: rect) {
                     result = r
@@ -512,7 +516,9 @@ struct CropView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Text("Saving permanently removes the cropped-out area and cuts exactly at your start and end points.")
+                Text(model.isCropped
+                     ? "Saving rebuilds the video: the cropped-out area is permanently removed and cuts are exact. This takes a few minutes for long videos."
+                     : "Trim only: saves in seconds. The cut starts at the nearest keyframe, up to a few seconds early.")
                     .font(.caption).foregroundStyle(.secondary)
 
                 HStack(spacing: 12) {
