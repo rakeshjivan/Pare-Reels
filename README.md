@@ -33,7 +33,7 @@ Paste the link as normal. If the downloader can't read the page, Pare Reels open
 - This works for recorded webinars only. Live streams have no file to save.
 
 ## Webinars behind a login
-- **Use login from:** log in to the site once in Safari, Chrome, Firefox, Edge or Brave, then pick that browser here.
+- **Use login from** is set to **Automatic**. Each download is tried without a login first. If the site asks for one, the app tries again using your usual browser's login (your default browser, otherwise Chrome, otherwise Safari). You can still pick a specific browser, or **Don't use**.
   - Chrome, Edge and Brave ask for your Mac password once. Click **Always Allow**.
   - Safari needs Full Disk Access. The app shows a button that opens the right Settings page.
 - If a video still needs access, its row shows **Unlock…**. Click it to enter a video password (Vimeo), or a site username and password, then try again. Passwords are never saved.

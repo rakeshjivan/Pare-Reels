@@ -64,6 +64,7 @@ enum Quality: String, CaseIterable, Identifiable {
 
 /// Borrow the login from a browser the user is already signed in with.
 enum BrowserLogin: String, CaseIterable, Identifiable {
+    case auto = "Automatic"
     case none = "Don't use"
     case safari = "Safari"
     case chrome = "Chrome"
@@ -75,7 +76,20 @@ enum BrowserLogin: String, CaseIterable, Identifiable {
     case chromium = "Chromium"
 
     var id: String { rawValue }
-    var ytdlpName: String? { self == .none ? nil : rawValue.lowercased() }
+    var ytdlpName: String? { (self == .none || self == .auto) ? nil : rawValue.lowercased() }
+
+    /// For "Automatic": the browser you normally use (your default browser if supported, else Chrome, else Safari).
+    static func preferred() -> BrowserLogin {
+        let map: [String: BrowserLogin] = [
+            "com.google.chrome": .chrome, "com.apple.safari": .safari, "org.mozilla.firefox": .firefox,
+            "com.microsoft.edgemac": .edge, "com.brave.browser": .brave, "com.vivaldi.vivaldi": .vivaldi,
+            "com.operasoftware.opera": .opera, "org.chromium.chromium": .chromium,
+        ]
+        if let app = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!),
+           let id = Bundle(url: app)?.bundleIdentifier?.lowercased(), let b = map[id] { return b }
+        if NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") != nil { return .chrome }
+        return .safari
+    }
 }
 
 /// Per-video credentials typed in when a download asks for them. Kept in memory only.
@@ -274,6 +288,7 @@ final class DownloadModel: ObservableObject {
     private var cancelRequested = false
     private var lastErrors: [Int: String] = [:]
     private var lastFiles: [Int: String] = [:]
+    private var autoBrowserUsed: BrowserLogin?
 
     /// Sites the downloader can't read, so we go straight to finding the file on the page.
     /// Webinar platforms and course sites (lectures sit behind a login; without it the page
@@ -293,7 +308,11 @@ final class DownloadModel: ObservableObject {
     init() {
         let d = UserDefaults.standard
         quality = Quality(rawValue: d.string(forKey: "quality") ?? "") ?? .p1080
-        browser = BrowserLogin(rawValue: d.string(forKey: "browser") ?? "") ?? .none
+        if !d.bool(forKey: "switchedToAutoLogin") {
+            d.set(true, forKey: "switchedToAutoLogin")
+            d.set(BrowserLogin.auto.rawValue, forKey: "browser")
+        }
+        browser = BrowserLogin(rawValue: d.string(forKey: "browser") ?? "") ?? .auto
         if let p = d.string(forKey: "folder"), FileManager.default.fileExists(atPath: p) {
             folder = URL(fileURLWithPath: p, isDirectory: true)
         } else {
@@ -486,7 +505,7 @@ final class DownloadModel: ObservableObject {
         current?.terminate()
     }
 
-    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true) -> [String] {
+    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true, loginOverride: BrowserLogin? = nil) -> [String] {
         let url = item.url
         var a = [
             "--newline", "--color", "never", "--no-playlist",
@@ -517,7 +536,7 @@ final class DownloadModel: ObservableObject {
             }
         }
         // Logins
-        if useBrowserLogin, let b = browser.ytdlpName { a += ["--cookies-from-browser", b] }
+        if useBrowserLogin, let b = (loginOverride ?? browser).ytdlpName { a += ["--cookies-from-browser", b] }
         let c = item.credentials
         if !c.videoPassword.isEmpty { a += ["--video-password", c.videoPassword] }
         if !c.username.isEmpty { a += ["--username", c.username] }
@@ -539,9 +558,19 @@ final class DownloadModel: ObservableObject {
             (ok, note) = await downloadDirect(index: i, job: job)
             try? FileManager.default.removeItem(at: job.cookiesFile)
         } else {
+            autoBrowserUsed = nil
             ok = await runYtdlp(arguments(for: items[i]), index: i) == 0
-            // YouTube sometimes rejects a browser login: try once more without it.
-            if !ok, !cancelRequested, browser != .none, Self.host(items[i].url, in: Self.youtubeHosts) {
+            // Automatic: the site wants a login, so try again with your usual browser's login.
+            if !ok, !cancelRequested, browser == .auto, isAuthError(lastErrors[i] ?? "") {
+                let b = BrowserLogin.preferred()
+                autoBrowserUsed = b
+                appendLog("Login needed: trying again with your \(b.rawValue) login…")
+                lastErrors[i] = nil
+                items[i].detail = "Trying with your \(b.rawValue) login…"
+                ok = await runYtdlp(arguments(for: items[i], loginOverride: b), index: i) == 0
+            }
+            // YouTube sometimes rejects a chosen browser login: try once more without it.
+            if !ok, !cancelRequested, browser != .none, browser != .auto, Self.host(items[i].url, in: Self.youtubeHosts) {
                 appendLog("Retrying without the browser login…")
                 lastErrors[i] = nil
                 items[i].detail = "Retrying…"
@@ -784,7 +813,7 @@ final class DownloadModel: ObservableObject {
         if e.contains("drm") {
             return "This is a paid streaming service with copy protection, so it can't be downloaded. Use the service's own app to save it for offline viewing."
         }
-        if e.contains("operation not permitted") && browser == .safari {
+        if e.contains("operation not permitted") && (browser == .safari || autoBrowserUsed == .safari) {
             needsFullDiskAccess = true
             return "Pare Reels needs Full Disk Access to use your Safari login (see the note above)."
         }
@@ -831,7 +860,7 @@ struct ContentView: View {
                 }
                 .frame(width: 240)
                 .disabled(model.isRunning)
-                .help("For webinars you can only watch when signed in: log in once in that browser, then pick it here.")
+                .help("Automatic tries without a login first, then with your usual browser's login only if the site asks for one.")
                 Spacer()
             }
 
