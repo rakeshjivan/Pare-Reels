@@ -411,21 +411,16 @@ struct CropView: View {
                         Button("Cancel") { model.cancel() }
                     } else {
                         Button("Save — Fast") { model.save(instant: false) }
-                            .help("Re-encodes with your Mac's video hardware. Cropped edges are permanently removed, trims are exact and the file is smaller. A few minutes for an hour of video.")
+                            .help("Re-encodes with your Mac's video hardware. Works everywhere, smaller file. A few minutes for an hour of video.")
                         Button("Save — Instant") { model.save(instant: true) }
                             .keyboardShortcut(.defaultAction)
                             .disabled(!model.canInstant)
                             .help(model.canInstant
-                                  ? "No re-encoding: done in seconds with no quality loss. Cropped edges are hidden, not deleted."
+                                  ? "No re-encoding: done in seconds with no quality loss."
                                   : "Instant crop isn't available for this video (rotated, or not H.264/HEVC). Use Fast.")
                     }
                 }
                 .controlSize(.large)
-
-                if model.isCropped {
-                    Label("Instant crop hides the edges, but they stay in the file and can be recovered. Use Fast to remove them permanently (e.g. patient details).", systemImage: "exclamationmark.shield")
-                        .font(.caption).foregroundStyle(.orange)
-                }
 
                 if let s = model.status {
                     HStack {

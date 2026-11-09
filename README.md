@@ -11,8 +11,8 @@ The app isn't signed by Apple, so the first time you open it macOS blocks it. Go
 
 ## Crop and trim a video
 Open the **Crop & Trim** tab, then drop in a video or click **Open Video…**. Drag the handles or the box, or pick a shape (16:9, 1:1, 9:16, 4:5, 4:3). Use the slider to check the crop works for the whole video. To trim, move the slider and click **Set Start** and **Set End**.
-- **Save — Instant** leaves the picture data untouched (trims start at the nearest keyframe, which can be up to a few seconds early), so there's no quality loss and an hour-long video saves in seconds. It works with H.264 and HEVC videos (almost all MP4/MOV files). A few older editing apps may ignore the crop. **The cropped edges are hidden, not deleted, and can be recovered.** Use Fast for anything sensitive.
-- **Save — Fast** permanently removes cropped edges, gives exact trims and re-encodes with your Mac's video hardware. It works everywhere and makes a smaller file, and takes a few minutes for an hour of 1080p.
+- **Save — Instant** leaves the picture data untouched (trims start at the nearest keyframe, which can be up to a few seconds early), so there's no quality loss and an hour-long video saves in seconds. It works with H.264 and HEVC videos (almost all MP4/MOV files). A few older editing apps may ignore the crop.
+- **Save — Fast** gives exact trims and re-encodes with your Mac's video hardware. It works everywhere and makes a smaller file, and takes a few minutes for an hour of 1080p.
 
 The cropped copy is saved next to the original as "… (cropped)".
 
