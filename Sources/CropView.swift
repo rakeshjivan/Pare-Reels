@@ -58,6 +58,8 @@ final class CropModel: ObservableObject {
     @Published var aspect: CropAspect = .free { didSet { applyAspect() } }
     @Published var codec = ""
     @Published var fps: Double = 30
+    /// Compress & Save found nothing to gain: ask whether to save the crop/trim without compressing.
+    @Published var offerPlainSave = false
     @Published var rotated = false
     @Published var busy = false
     @Published var progress: Double?
@@ -323,6 +325,7 @@ final class CropModel: ObservableObject {
                 }
                 status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB\(smaller).\(note)"
             } else {
+                if compress, compressRefusal != nil, isCropped || isTrimmed { offerPlainSave = true }
                 status = compress && compressRefusal != nil ? compressRefusal
                     : how == .secure ? "Secure save failed: \(note)"
                     : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
@@ -817,6 +820,12 @@ struct CropView: View {
                         Button("Cancel") { model.cancel() }
                     } else {
                         Button("Compress & Save") { model.save(.fast, compress: true) }
+                            .alert("This video can't be made any smaller", isPresented: $model.offerPlainSave) {
+                                Button("Save Without Compressing") { model.save(.fast) }
+                                Button("Cancel", role: .cancel) {}
+                            } message: {
+                                Text("It's already compressed about as far as it can go without visible loss. Save your crop and trim anyway, without compressing?")
+                            }
                             .help("Saves your crop and trim as the smallest file that still looks the same (HEVC).")
                         Button("Save") { model.save(.fast) }
                             .keyboardShortcut(.defaultAction)
