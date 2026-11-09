@@ -57,6 +57,7 @@ final class CropModel: ObservableObject {
     @Published var crop = CGRect(x: 0, y: 0, width: 1, height: 1)   // 0...1 of the frame
     @Published var aspect: CropAspect = .free { didSet { applyAspect() } }
     @Published var codec = ""
+    @Published var fps: Double = 30
     @Published var rotated = false
     @Published var busy = false
     @Published var progress: Double?
@@ -118,6 +119,8 @@ final class CropModel: ObservableObject {
             videoSize = CGSize(width: abs(shown.width), height: abs(shown.height))
             rotated = !(t.a == 1 && t.d == 1 && t.b == 0 && t.c == 0)
             duration = try await asset.load(.duration).seconds
+            let rate = try await track.load(.nominalFrameRate)
+            fps = rate > 0 ? Double(rate) : 30
             let fds = try await track.load(.formatDescriptions)
             let subtype: FourCharCode = fds.first.map { CMFormatDescriptionGetMediaSubType($0) } ?? 0
             switch subtype {
@@ -979,6 +982,10 @@ struct CompressView: View {
             }
             if let u = model.url {
                 Text(details(u)).monospacedDigit().foregroundStyle(.secondary)
+                if let warn = alreadyCompact(u) {
+                    Label(warn, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange).font(.callout)
+                }
                 Text("Makes the smallest file that still looks the same. A few quality levels are tested on samples first (about 20–30 seconds), then the whole video is saved in HEVC using your Mac's video hardware. HEVC plays on Apple devices, current Chrome and Edge, and Android; some older Windows PCs need a free add-on.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack(spacing: 12) {
@@ -991,7 +998,11 @@ struct CompressView: View {
                         if let info = model.liveInfo { Text(info).monospacedDigit().foregroundStyle(.secondary) }
                         Button("Cancel") { model.cancel() }
                     } else {
-                        Button("Compress") { model.save(.fast, compress: true) }.keyboardShortcut(.defaultAction)
+                        if alreadyCompact(u) != nil {
+                            Button("Try Anyway") { model.save(.fast, compress: true) }
+                        } else {
+                            Button("Compress") { model.save(.fast, compress: true) }.keyboardShortcut(.defaultAction)
+                        }
                     }
                 }
                 .controlSize(.large)
@@ -1007,6 +1018,18 @@ struct CompressView: View {
             Spacer(minLength: 0)
         }
         .padding(20)
+    }
+
+    /// Videos stored with very little data per pixel can't get smaller without looking worse:
+    /// say so before the user waits for anything.
+    private func alreadyCompact(_ u: URL) -> String? {
+        let bytes = Double((try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? NSNumber)?.int64Value ?? 0)
+        let px = model.videoSize.width * model.videoSize.height
+        guard model.duration > 0, px > 0 else { return nil }
+        let rate = bytes * 8 / model.duration
+        let bitsPerPixel = rate / (Double(px) * model.fps)
+        guard bitsPerPixel < 0.04 else { return nil }
+        return String(format: "This video is already very compact (%.1f Mbps), so compressing it probably won't make it smaller without visible loss. It's not worth trying. Compress works best on large originals: iPhone videos, screen recordings, local Zoom recordings.", rate / 1e6)
     }
 
     private func details(_ u: URL) -> String {
