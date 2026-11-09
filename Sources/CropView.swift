@@ -209,12 +209,17 @@ final class CropModel: ObservableObject {
         if method == .secure { secure.cancel() }
     }
 
+    private var compressing = false
     private var suffix: String {
+        let base: String
         switch (isCropped, isTrimmed) {
-        case (true, true): return "edited"
-        case (false, true): return "trimmed"
-        default: return "cropped"
+        case (true, true): base = "edited"
+        case (false, true): base = "trimmed"
+        case (true, false): base = "cropped"
+        default: base = ""
         }
+        if compressing { return base.isEmpty ? "compressed" : base + ", compressed" }
+        return base.isEmpty ? "copy" : base
     }
 
     private func outputURL(for src: URL, ext: String) -> URL {
@@ -226,10 +231,10 @@ final class CropModel: ObservableObject {
         return DownloadModel.uniqueURL(in: dir, name: base, ext: ext)
     }
 
-    func save(_ how: SaveMethod) {
+    func save(_ how: SaveMethod, compress: Bool = false) {
         let instant = how == .instant
         guard let src = url, !busy else { return }
-        guard isCropped || isTrimmed else {
+        guard compress || isCropped || isTrimmed else {
             status = "Nothing to change yet. Drag the crop handles or set a start or end point."
             return
         }
@@ -238,10 +243,11 @@ final class CropModel: ObservableObject {
             return
         }
         method = how
+        compressing = compress
         liveInfo = nil
         busy = true; cancelled = false; savedFile = nil
         progress = instant ? nil : 0
-        status = ["instant": "Saving (instant)…", "fast": "Saving…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
+        status = compress ? "Compressing…" : ["instant": "Saving (instant)…", "fast": "Saving…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
         let rect = pixelRect
         let started = Date()
         Task {
@@ -249,13 +255,24 @@ final class CropModel: ObservableObject {
             var result: URL?
             switch how {
             case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
+            case .fast where compress:
+                // Smallest file that still looks the same: test a few quality levels on samples,
+                // then encode in HEVC with change-only encoding, pieces shared out to the workers.
+                let pick = await pickQuality(src: src, ff: ff, rect: rect)
+                if cancelled { break }
+                let enc = ["-c:v", "hevc_videotoolbox", "-q:v", "\(pick.q)", "-tag:v", "hvc1"]
+                if let r = await saveParallel(src: src, ff: ff, rect: rect, encoder: enc, audio: "128k") {
+                    result = r
+                    note = " Quality: \(pick.label). Engine: \(fastEncoder), HEVC."
+                }
             case .fast where !isCropped:
                 // Trim only: no rebuild needed — instant, works in every player.
                 result = await saveInstant(src: src, ff: ff, rect: rect)
                 note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
             case .fast:
                 // Main engine: parts side by side, change-only encoding, Mac hardware.
-                if let r = await saveParallel(src: src, ff: ff, rect: rect) {
+                if let r = await saveParallel(src: src, ff: ff, rect: rect,
+                                              encoder: ["-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65"], audio: "192k") {
                     result = r
                     note = " Engine: \(fastEncoder)."
                 } else if !cancelled, let r = await saveFast(src: src, ff: ff, rect: rect) {
@@ -291,7 +308,11 @@ final class CropModel: ObservableObject {
                 let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
                 let media = isTrimmed ? trimEnd - trimStart : duration
                 let speed = secs > 0 ? String(format: " · %.1f× real time", media / secs) : ""
-                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB.\(note)"
+                var smaller = ""
+                if compress, let inBytes = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.doubleValue, inBytes > 0 {
+                    smaller = String(format: " (was %.0f MB, %.0f%% smaller)", inBytes / 1_048_576, max(0, 100 - mb * 1_048_576 / inBytes * 100))
+                }
+                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB\(smaller).\(note)"
             } else {
                 status = how == .secure ? "Secure save failed: \(note)"
                     : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
@@ -420,9 +441,106 @@ final class CropModel: ObservableObject {
         }
     }
 
+    private func cropFilter(_ rect: CGRect) -> String {
+        "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY))"
+    }
+
+    /// Runs ffmpeg and returns its messages (where it reports quality scores).
+    private func runForLog(_ exe: URL, _ args: [String]) async -> String {
+        await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            let p = Process()
+            p.executableURL = exe
+            p.arguments = args
+            let pipe = Pipe()
+            p.standardError = pipe
+            p.standardOutput = FileHandle.nullDevice
+            final class Buf: @unchecked Sendable { var data = Data(); let lock = NSLock() }
+            let buf = Buf()
+            pipe.fileHandleForReading.readabilityHandler = { h in
+                let d = h.availableData
+                if d.isEmpty { h.readabilityHandler = nil } else { buf.lock.lock(); buf.data.append(d); buf.lock.unlock() }
+            }
+            p.terminationHandler = { _ in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                let rest = pipe.fileHandleForReading.readDataToEndOfFile()
+                buf.lock.lock(); buf.data.append(rest); let all = String(decoding: buf.data, as: UTF8.self); buf.lock.unlock()
+                cont.resume(returning: all)
+            }
+            do { try p.run(); extraProcesses.append(p) } catch { cont.resume(returning: "") }
+        }
+    }
+
+    /// Finds the lowest HEVC quality setting whose result still looks the same as the original.
+    /// Short samples from the start, middle and end are encoded at a few settings and scored with
+    /// VMAF (Netflix's measure; 95+ looks the same to most viewers), or SSIM if VMAF isn't available.
+    private func pickQuality(src: URL, ff: URL, rect: CGRect) async -> (q: Int, label: String) {
+        let mediaLen = isTrimmed ? trimEnd - trimStart : duration
+        let start = isTrimmed ? trimStart : 0
+        let sampleLen = min(8.0, mediaLen)
+        let spots: [Double] = mediaLen >= 60 ? [0.2, 0.5, 0.8] : [0]
+        let at = spots.map { start + $0 * max(0, mediaLen - sampleLen) }
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-q-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+        let crop = isCropped ? [cropFilter(rect)] : []
+        let vmaf = (await runForLogOut(ff, ["-hide_banner", "-filters"])).contains("libvmaf")
+
+        // Score one quality setting: the worst of the samples.
+        func score(_ q: Int) async -> Double {
+            await withTaskGroup(of: Double.self) { group in
+                for (i, a) in at.enumerated() {
+                    group.addTask {
+                        let out = work.appendingPathComponent("q\(q)-\(i).mp4")
+                        let ss = String(format: "%.3f", a), len = String(format: "%.3f", sampleLen)
+                        var enc = ["-y", "-loglevel", "error", "-hwaccel", "videotoolbox", "-ss", ss, "-i", src.path, "-t", len,
+                                   "-map", "0:v:0", "-an"]
+                        if !crop.isEmpty { enc += ["-vf", crop[0]] }
+                        enc += ["-c:v", "hevc_videotoolbox", "-q:v", "\(q)", "-tag:v", "hvc1", out.path]
+                        _ = await self.runForLog(ff, enc)
+                        let ref = (crop.isEmpty ? "" : crop[0] + ",") + "setpts=PTS-STARTPTS"
+                        let metric = vmaf ? "libvmaf=n_threads=4:n_subsample=2" : "ssim"
+                        let log = await self.runForLog(ff, ["-hide_banner", "-nostats", "-i", out.path, "-ss", ss, "-t", len, "-i", src.path,
+                            "-lavfi", "[0:v]setpts=PTS-STARTPTS[d];[1:v]\(ref)[r];[d][r]\(metric)", "-f", "null", "-"])
+                        return Self.parseScore(log, vmaf: vmaf)
+                    }
+                }
+                var worst = Double.infinity
+                for await v in group { worst = min(worst, v) }
+                return worst == .infinity ? 0 : worst
+            }
+        }
+        let target = vmaf ? 95.0 : 0.985
+        let levels = [45, 52, 59, 66, 73]
+        var lo = 0, hi = levels.count - 1, best: (Int, Double)? = nil, tests = 0
+        while lo <= hi, !cancelled {          // binary search for the lowest setting that passes
+            let mid = (lo + hi) / 2
+            tests += 1
+            liveInfo = "finding the smallest size that still looks the same (test \(tests))…"
+            let v = await score(levels[mid])
+            if v >= target { best = (levels[mid], v); hi = mid - 1 } else { lo = mid + 1 }
+        }
+        liveInfo = nil
+        guard let b = best else { return (80, "high (no tested setting reached the target)") }
+        return (b.0, vmaf ? String(format: "VMAF %.1f, looks the same", b.1) : String(format: "SSIM %.3f", b.1))
+    }
+
+    private func runForLogOut(_ exe: URL, _ args: [String]) async -> String {
+        let (_, out) = await Tools.capture(exe.path, args)
+        return out
+    }
+
+    nonisolated static func parseScore(_ log: String, vmaf: Bool) -> Double {
+        if vmaf {
+            guard let r = log.range(of: "VMAF score: ", options: .backwards) else { return 0 }
+            return Double(log[r.upperBound...].prefix { "0123456789.".contains($0) }) ?? 0
+        }
+        guard let r = log.range(of: "All:", options: .backwards) else { return 0 }
+        return Double(log[r.upperBound...].prefix { "0123456789.".contains($0) }) ?? 0
+    }
+
     /// Crop save for long videos: split into parts, process them side by side with change-only
     /// encoding on the Mac's video hardware, then join losslessly and add the original sound.
-    private func saveParallel(src: URL, ff: URL, rect: CGRect) async -> URL? {
+    private func saveParallel(src: URL, ff: URL, rect: CGRect, encoder: [String], audio: String) async -> URL? {
         let mediaLen = isTrimmed ? trimEnd - trimStart : duration
         let start = isTrimmed ? trimStart : 0
         let cores = ProcessInfo.processInfo.activeProcessorCount
@@ -430,11 +548,10 @@ final class CropModel: ObservableObject {
         // processor cores, which would otherwise sit idle.
         let n = mediaLen < 180 ? 1 : min(8, max(2, cores - 2))
         let hwParts = min(n, 4)
-        guard n > 1 else { return nil }
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-parts-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
-        let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY)),mpdecimate=hi=256:lo=128:frac=0.1:max=30"
+        let filter = (isCropped ? cropFilter(rect) + "," : "") + "mpdecimate=hi=256:lo=128:frac=0.1:max=30"
         fastEncoder = "Mac hardware, change-only encoding, \(n) at once"
             + (n > hwParts ? " (\(n - hwParts) decoded by the processor)" : "")
 
@@ -452,7 +569,7 @@ final class CropModel: ObservableObject {
             parts.append((out, b - a))
             jobs.append(["-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
                          "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
-                         "-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65", out.path])
+                         ] + encoder + [out.path])
         }
         final class Line: @unchecked Sendable {
             private var next = 0; private let lock = NSLock(); let count: Int
@@ -510,7 +627,8 @@ final class CropModel: ObservableObject {
         var args = ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list.path]
         if start > 0 { args += ["-ss", String(format: "%.3f", start)] }
         args += ["-t", String(format: "%.3f", mediaLen), "-i", src.path,
-                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy"] + (encoder.contains("hevc_videotoolbox") ? ["-tag:v", "hvc1"] : []) + [
+                 "-c:a", "aac", "-b:a", audio,
                  "-movflags", "+faststart", out.path]
         let code = await run(ff, args)
         progress = 1
@@ -673,6 +791,8 @@ struct CropView: View {
                         }
                         Button("Cancel") { model.cancel() }
                     } else {
+                        Button("Compress & Save") { model.save(.fast, compress: true) }
+                            .help("Saves your crop and trim as the smallest file that still looks the same (HEVC).")
                         Button("Save") { model.save(.fast) }
                             .keyboardShortcut(.defaultAction)
                             .help("Rebuilds the video with your Mac's video hardware: the cropped area is permanently removed and trims are exact.")
@@ -801,5 +921,76 @@ struct TrimBar: View {
                     .offset(x: g.size.width * CGFloat(min(playhead, d) / d) - 1)
             }
         }
+    }
+}
+
+
+/// Compress tab: one video in, the smallest file that still looks the same out.
+struct CompressView: View {
+    @StateObject private var model = CropModel()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Button("Open Video…") { model.choose() }.disabled(model.busy)
+                if let u = model.url {
+                    Text(u.lastPathComponent).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            ZStack {
+                RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.85))
+                if let img = model.frame {
+                    Image(decorative: img, scale: 1).resizable().aspectRatio(contentMode: .fit).padding(14)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 34)).foregroundStyle(.secondary)
+                        Text("Drop a video here, or click Open Video…").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(minHeight: 300)
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let u = urls.first, !model.busy else { return false }
+                Task { await model.open(u) }
+                return true
+            }
+            if let u = model.url {
+                Text(details(u)).monospacedDigit().foregroundStyle(.secondary)
+                Text("Makes the smallest file that still looks the same. A few quality levels are tested on samples first (about 20–30 seconds), then the whole video is saved in HEVC using your Mac's video hardware. HEVC plays on Apple devices, current Chrome and Edge, and Android; some older Windows PCs need a free add-on.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Spacer()
+                    if model.busy {
+                        if let p = model.progress {
+                            ProgressView(value: p).frame(width: 160)
+                            Text("\(Int(p * 100))%").monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        if let info = model.liveInfo { Text(info).monospacedDigit().foregroundStyle(.secondary) }
+                        Button("Cancel") { model.cancel() }
+                    } else {
+                        Button("Compress") { model.save(.fast, compress: true) }.keyboardShortcut(.defaultAction)
+                    }
+                }
+                .controlSize(.large)
+                if let s = model.status {
+                    HStack {
+                        Text(s).font(.callout).foregroundStyle(.secondary)
+                        if let f = model.savedFile {
+                            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([f]) }.controlSize(.small)
+                        }
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+    }
+
+    private func details(_ u: URL) -> String {
+        let mb = Double((try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
+        let t = Int(model.duration)
+        let len = t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60) : String(format: "%d:%02d", t / 60, t % 60)
+        return "\(Int(model.videoSize.width)) × \(Int(model.videoSize.height)) · \(len) · \(String(format: "%.0f", mb)) MB"
     }
 }
