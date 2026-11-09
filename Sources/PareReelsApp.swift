@@ -766,6 +766,9 @@ final class DownloadModel: ObservableObject {
 
     private func friendly(_ error: String) -> String {
         let e = error.lowercased()
+        if e.contains("drm") {
+            return "This is a paid streaming service with copy protection, so it can't be downloaded. Use the service's own app to save it for offline viewing."
+        }
         if e.contains("operation not permitted") && browser == .safari {
             needsFullDiskAccess = true
             return "Pare Reels needs Full Disk Access to use your Safari login (see the note above)."
