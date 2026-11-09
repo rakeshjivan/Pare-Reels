@@ -471,7 +471,7 @@ final class DownloadModel: ObservableObject {
             "--newline", "--color", "never", "--no-playlist",
             "-N", "8",   // fetch streamed videos in 8 pieces at once
             "-P", folder.path,
-            "-o", "%(title)s [%(id)s].%(ext)s",
+            "-o", "%(title).100B [%(id)s].%(ext)s", "--trim-filenames", "180",  // Facebook/Instagram titles are whole posts
             "--progress-template", "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
             "--print", "before_dl:TITLE %(title)s", "--no-simulate",
         ]
