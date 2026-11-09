@@ -435,25 +435,32 @@ final class CropModel: ObservableObject {
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
         let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY)),mpdecimate=hi=256:lo=128:frac=0.1:max=30"
-        fastEncoder = "Mac hardware, change-only encoding, \(n) parts side by side"
+        fastEncoder = "Mac hardware, change-only encoding, \(n) at once"
             + (n > hwParts ? " (\(n - hwParts) decoded by the processor)" : "")
 
+        // Many small pieces handed out to the workers as they free up: the faster hardware
+        // workers simply take more pieces, so everyone finishes together.
+        let pieces = max(n, min(n * 4, Int(mediaLen / 60)))
         final class Done: @unchecked Sendable { var seconds = 0.0 }
-        let done = (0..<n).map { _ in Done() }
+        let done = (0..<pieces).map { _ in Done() }
         var parts: [(URL, Double)] = []
         var jobs: [[String]] = []
-        for i in 0..<n {
-            let a = start + Double(i) * mediaLen / Double(n)
-            let b = i == n - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(n)
+        for i in 0..<pieces {
+            let a = start + Double(i) * mediaLen / Double(pieces)
+            let b = i == pieces - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(pieces)
             let out = work.appendingPathComponent("part\(i).mp4")
             parts.append((out, b - a))
-            let hw = (i * hwParts) / n != ((i + 1) * hwParts) / n   // spread the hardware parts evenly
-            let decode = hw ? ["-hwaccel", "videotoolbox"] : ["-threads", "2"]
-            jobs.append(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode + [
-                         "-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
+            jobs.append(["-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
                          "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
                          "-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65", out.path])
         }
+        final class Line: @unchecked Sendable {
+            private var next = 0; private let lock = NSLock(); let count: Int
+            init(_ count: Int) { self.count = count }
+            func take() -> Int? { lock.lock(); defer { lock.unlock() }; guard next < count else { return nil }; next += 1; return next - 1 }
+        }
+        let line = Line(pieces)
+        let allJobs = jobs
 
         let started = Date()
         let poll = Task { @MainActor [weak self] in
@@ -463,7 +470,7 @@ final class CropModel: ObservableObject {
                 self?.progress = min(0.98, sum / mediaLen)
                 if elapsed > 20, sum > 0 {
                     let speed = sum / elapsed, left = (mediaLen - sum) / speed
-                    self?.liveInfo = String(format: "%.1f× · %d parts · ", speed, n)
+                    self?.liveInfo = String(format: "%.1f× · %d at once · ", speed, n)
                         + (left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left")
                 } else {
                     self?.liveInfo = "estimating time…"
@@ -472,16 +479,26 @@ final class CropModel: ObservableObject {
             }
         }
         var codes: [Int32] = []
-        await withTaskGroup(of: Int32.self) { group in
-            for i in 0..<n {
-                let args = jobs[i], counter = done[i]
-                group.addTask { await self.runTracked(ff, args) { s in counter.seconds = s } }
+        await withTaskGroup(of: [Int32].self) { group in
+            for w in 0..<n {
+                let decode = w < hwParts ? ["-hwaccel", "videotoolbox"] : ["-threads", "2"]
+                group.addTask {
+                    var mine: [Int32] = []
+                    while let i = line.take() {
+                        if await self.cancelled { break }
+                        let counter = done[i]
+                        let code = await self.runTracked(ff, ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode + allJobs[i]) { s in counter.seconds = s }
+                        mine.append(code)
+                        if code != 0 { break }
+                    }
+                    return mine
+                }
             }
-            for await c in group { codes.append(c) }
+            for await c in group { codes.append(contentsOf: c) }
         }
         poll.cancel()
         extraProcesses = []
-        if cancelled || codes.contains(where: { $0 != 0 }) { return nil }
+        if cancelled || codes.count != pieces || codes.contains(where: { $0 != 0 }) { return nil }
 
         // Join the parts (each told its exact length so the timing never drifts) and add the original sound.
         liveInfo = "joining parts…"
