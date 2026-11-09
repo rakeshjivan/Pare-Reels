@@ -519,7 +519,7 @@ final class DownloadModel: ObservableObject {
         current?.terminate()
     }
 
-    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true, loginOverride: BrowserLogin? = nil) -> [String] {
+    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true, loginOverride: BrowserLogin? = nil, pieces: Int = 32) -> [String] {
         let url = item.url
         var a = [
             "--newline", "--color", "never", "--no-playlist",
@@ -531,9 +531,11 @@ final class DownloadModel: ObservableObject {
             "--progress",   // --print switches on quiet mode, which hides progress unless asked for
         ]
         // YouTube serves each file as one slow, rate-limited stream. Asking for it as many small
-        // pieces lets 16 of them download at once.
+        // pieces lets 32 of them download at once (16 if YouTube pushes back).
+        // A refused piece must stop the download, never be silently left out of the file.
         if Self.host(url, in: Self.youtubeHosts) {
-            a += ["--extractor-args", "youtube:formats=dashy", "-N", "16"]
+            a += ["--extractor-args", "youtube:formats=dashy", "-N", "\(pieces)",
+                  "--abort-on-unavailable-fragments", "--fragment-retries", "10"]
         }
         if let ff = ffmpeg {
             a += ["--ffmpeg-location", ff.deletingLastPathComponent().path]
@@ -580,6 +582,14 @@ final class DownloadModel: ObservableObject {
         } else {
             autoBrowserUsed = nil
             ok = await runYtdlp(arguments(for: items[i]), index: i) == 0
+            // YouTube refused some of the 32 pieces: carry on with 16 (finished pieces are kept).
+            if !ok, !cancelRequested, Self.host(items[i].url, in: Self.youtubeHosts),
+               !isAuthError(lastErrors[i] ?? "") {
+                appendLog("YouTube pushed back: continuing with 16 pieces at once…")
+                lastErrors[i] = nil
+                items[i].detail = "Continuing more gently…"
+                ok = await runYtdlp(arguments(for: items[i], pieces: 16), index: i) == 0
+            }
             // Automatic: the site wants a login, so try again with your usual browser's login.
             if !ok, !cancelRequested, browser == .auto, isAuthError(lastErrors[i] ?? "") {
                 let b = BrowserLogin.preferred()
@@ -594,7 +604,7 @@ final class DownloadModel: ObservableObject {
                 appendLog("Retrying without the browser login…")
                 lastErrors[i] = nil
                 items[i].detail = "Retrying…"
-                ok = await runYtdlp(arguments(for: items[i], useBrowserLogin: false), index: i) == 0
+                ok = await runYtdlp(arguments(for: items[i], useBrowserLogin: false, pieces: 16), index: i) == 0
             }
         }
 
