@@ -461,6 +461,7 @@ final class DownloadModel: ObservableObject {
         let url = item.url
         var a = [
             "--newline", "--color", "never", "--no-playlist",
+            "-N", "8",   // fetch streamed videos in 8 pieces at once
             "-P", folder.path,
             "-o", "%(title)s [%(id)s].%(ext)s",
             "--progress-template", "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
@@ -577,6 +578,7 @@ final class DownloadModel: ObservableObject {
     private func directArgs(_ job: DirectJob, output: String) -> [String] {
         var a = [
             "--newline", "--color", "never", "--no-playlist",
+            "-N", "8",   // fetch streamed videos in 8 pieces at once
             "-P", folder.path, "-o", output,
             "--progress-template", Self.progressTemplate,
             "--print", "after_move:FILE %(filepath)s", "--no-simulate",
