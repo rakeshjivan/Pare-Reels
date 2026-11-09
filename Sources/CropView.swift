@@ -76,6 +76,13 @@ final class CropModel: ObservableObject {
     private var cancelled = false
 
     var isCropped: Bool { crop.minX > 0.001 || crop.minY > 0.001 || crop.width < 0.999 || crop.height < 0.999 }
+    /// Areas to blur (0...1 of the frame), for names, faces or IDs. Blurred for the whole video.
+    @Published var blurs: [CGRect] = []
+    /// 1 = normal; 1.5 = one and a half times as fast (voices keep their normal pitch).
+    @Published var speed: Double = 1
+    /// Anything that needs the picture rebuilt besides a crop.
+    var hasEffects: Bool { !blurs.isEmpty || abs(speed - 1) > 0.001 }
+    func addBlur() { blurs.append(CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)) }
     var isTrimmed: Bool { trimStart > 0.05 || trimEnd < duration - 0.05 }
     /// Trimming alone works on any video; cropping instantly needs H.264/HEVC that isn't rotated.
     var canInstant: Bool { !isCropped || ((codec == "h264" || codec == "hevc") && !rotated) }
@@ -83,6 +90,27 @@ final class CropModel: ObservableObject {
     func setStart() { trimStart = min(time, max(0, trimEnd - 0.5)) }
     func setEnd() { trimEnd = max(time, min(duration, trimStart + 0.5)) }
     func clearTrim() { trimStart = 0; trimEnd = duration }
+
+    func pixels(_ n: CGRect) -> CGRect {
+        func even(_ v: CGFloat) -> CGFloat { (v / 2).rounded(.down) * 2 }
+        let W = videoSize.width, H = videoSize.height
+        var x = even(n.minX * W), y = even(n.minY * H)
+        var w = even(n.width * W), h = even(n.height * H)
+        w = max(16, min(w, even(W - x))); h = max(16, min(h, even(H - y)))
+        x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    /// Free resize (no shape lock), used for blur boxes.
+    func resizedFree(from s: CGRect, handle: CropHandle, dx: CGFloat, dy: CGFloat) -> CGRect {
+        let minSize: CGFloat = 0.02
+        var minX = s.minX, maxX = s.maxX, minY = s.minY, maxY = s.maxY
+        if handle.left { minX = min(max(0, minX + dx), maxX - minSize) }
+        if handle.right { maxX = max(min(1, maxX + dx), minX + minSize) }
+        if handle.top { minY = min(max(0, minY + dy), maxY - minSize) }
+        if handle.bottom { maxY = max(min(1, maxY + dy), minY + minSize) }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
 
     var pixelRect: CGRect {
         // Whole, even pixel values (needed by the video formats).
@@ -142,6 +170,7 @@ final class CropModel: ObservableObject {
         generator = g
         self.url = url
         crop = CGRect(x: 0, y: 0, width: 1, height: 1)
+        blurs = []; speed = 1
         applyAspect()
         trimStart = 0
         trimEnd = duration
@@ -197,6 +226,7 @@ final class CropModel: ObservableObject {
 
     func reset() {
         crop = CGRect(x: 0, y: 0, width: 1, height: 1)
+        blurs = []; speed = 1
         applyAspect()
     }
 
@@ -217,7 +247,8 @@ final class CropModel: ObservableObject {
     private var compressing = false
     private var suffix: String {
         let base: String
-        switch (isCropped, isTrimmed) {
+        switch (isCropped || hasEffects, isTrimmed) {
+        case _ where hasEffects: base = "edited"
         case (true, true): base = "edited"
         case (false, true): base = "trimmed"
         case (true, false): base = "cropped"
@@ -239,7 +270,7 @@ final class CropModel: ObservableObject {
     func save(_ how: SaveMethod, compress: Bool = false) {
         let instant = how == .instant
         guard let src = url, !busy else { return }
-        guard compress || isCropped || isTrimmed else {
+        guard compress || isCropped || isTrimmed || hasEffects else {
             status = "Nothing to change yet. Drag the crop handles or set a start or end point."
             return
         }
@@ -270,7 +301,7 @@ final class CropModel: ObservableObject {
                     result = r
                     note = " Quality: \(pick.label). Engine: \(fastEncoder), HEVC."
                 }
-            case .fast where !isCropped:
+            case .fast where !isCropped && !hasEffects:
                 // Trim only: no rebuild needed — instant, works in every player.
                 result = await saveInstant(src: src, ff: ff, rect: rect)
                 note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
@@ -283,7 +314,7 @@ final class CropModel: ObservableObject {
                 } else if !cancelled, let r = await saveFast(src: src, ff: ff, rect: rect) {
                     result = r
                     note = " Engine: \(fastEncoder)."
-                } else if !cancelled, let r = await saveApple(src: src, rect: rect) {
+                } else if !cancelled, !hasEffects, let r = await saveApple(src: src, rect: rect) {
                     result = r
                     note = " (Used the backup engine: Apple export.)"
                 }
@@ -311,13 +342,13 @@ final class CropModel: ObservableObject {
             } else if compress, let out = result,
                       let inB = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.int64Value,
                       let outB = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value,
-                      outB >= inB, !isCropped, !isTrimmed {
+                      outB >= inB, !isCropped, !isTrimmed, !hasEffects {
                 try? FileManager.default.removeItem(at: out)
                 status = "The compressed file came out no smaller than the original, so it was discarded. This video is already compressed about as far as it can go."
             } else if let out = result {
                 savedFile = out
                 let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
-                let media = isTrimmed ? trimEnd - trimStart : duration
+                let media = (isTrimmed ? trimEnd - trimStart : duration) / speed
                 let speed = secs > 0 ? String(format: " · %.1f× real time", media / secs) : ""
                 var smaller = ""
                 if compress, let inBytes = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.doubleValue, inBytes > 0 {
@@ -325,7 +356,7 @@ final class CropModel: ObservableObject {
                 }
                 status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs))\(speed) · \(String(format: "%.0f", mb)) MB\(smaller).\(note)"
             } else {
-                if compress, compressRefusal != nil, isCropped || isTrimmed { offerPlainSave = true }
+                if compress, compressRefusal != nil, isCropped || isTrimmed || hasEffects { offerPlainSave = true }
                 status = compress && compressRefusal != nil ? compressRefusal
                     : how == .secure ? "Secure save failed: \(note)"
                     : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
@@ -458,6 +489,20 @@ final class CropModel: ObservableObject {
         "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY))"
     }
 
+    /// Blur boxes, then the crop: everything that changes how the picture looks (no timing changes).
+    /// Blurs are heavy (three passes) so names and faces can't be read back.
+    private func lookFilter(_ rect: CGRect) -> String? {
+        var parts: [String] = []
+        for (i, b) in blurs.enumerated() {
+            let p = pixels(b)
+            let w = Int(p.width), h = Int(p.height), x = Int(p.minX), y = Int(p.minY)
+            let r = max(1, min(min(w, h) / 2 - 1, 40)), rc = max(1, min(r, min(w, h) / 4 - 1))
+            parts.append("split[m\(i)][s\(i)];[s\(i)]crop=\(w):\(h):\(x):\(y),boxblur=luma_radius=\(r):luma_power=3:chroma_radius=\(rc):chroma_power=3[b\(i)];[m\(i)][b\(i)]overlay=\(x):\(y)")
+        }
+        if isCropped { parts.append(cropFilter(rect)) }
+        return parts.isEmpty ? nil : parts.joined(separator: ",")
+    }
+
     /// Runs ffmpeg and returns its messages (where it reports quality scores).
     private func runForLog(_ exe: URL, _ args: [String]) async -> String {
         await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
@@ -497,7 +542,7 @@ final class CropModel: ObservableObject {
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-q-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
-        let crop = isCropped ? [cropFilter(rect)] : []
+        let crop = lookFilter(rect).map { [$0] } ?? []
         let vmaf = (await runForLogOut(ff, ["-hide_banner", "-filters"])).contains("libvmaf")
 
         // Score one quality setting: the worst of the samples.
@@ -579,7 +624,9 @@ final class CropModel: ObservableObject {
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-parts-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
-        let filter = (isCropped ? cropFilter(rect) + "," : "") + "mpdecimate=hi=256:lo=128:frac=0.1:max=30"
+        let sp = speed
+        let filter = (lookFilter(rect).map { $0 + "," } ?? "") + "mpdecimate=hi=256:lo=128:frac=0.1:max=30"
+            + (abs(sp - 1) > 0.001 ? String(format: ",setpts=PTS/%.4f", sp) : "")
         fastEncoder = "Mac hardware, change-only encoding, \(n) at once"
             + (n > hwParts ? " (\(n - hwParts) decoded by the processor)" : "")
 
@@ -594,7 +641,7 @@ final class CropModel: ObservableObject {
             let a = start + Double(i) * mediaLen / Double(pieces)
             let b = i == pieces - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(pieces)
             let out = work.appendingPathComponent("part\(i).mp4")
-            parts.append((out, b - a))
+            parts.append((out, (b - a) / sp))
             jobs.append(["-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
                          "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
                          ] + encoder + [out.path])
@@ -610,7 +657,7 @@ final class CropModel: ObservableObject {
         let started = Date()
         let poll = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                let sum = done.map(\.seconds).reduce(0, +)
+                let sum = done.map(\.seconds).reduce(0, +) * sp   // pieces report output time
                 let elapsed = Date().timeIntervalSince(started)
                 self?.progress = min(0.98, sum / mediaLen)
                 if elapsed > 20, sum > 0 {
@@ -656,6 +703,7 @@ final class CropModel: ObservableObject {
         if start > 0 { args += ["-ss", String(format: "%.3f", start)] }
         args += ["-t", String(format: "%.3f", mediaLen), "-i", src.path,
                  "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy"] + (encoder.contains("hevc_videotoolbox") ? ["-tag:v", "hvc1"] : []) + [
+                 ] + (abs(sp - 1) > 0.001 ? ["-af", String(format: "atempo=%.4f", sp)] : []) + [
                  "-c:a", "aac", "-b:a", audio,
                  "-movflags", "+faststart", out.path]
         let code = await run(ff, args)
@@ -666,8 +714,8 @@ final class CropModel: ObservableObject {
 
     private func saveFast(src: URL, ff: URL, rect: CGRect) async -> URL? {
         let out = outputURL(for: src, ext: "mp4")
-        let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY))"
-        let cropIt = isCropped, trimIt = isTrimmed
+        let look = lookFilter(rect), sp = speed
+        let cropIt = look != nil || abs(sp - 1) > 0.001, trimIt = isTrimmed
         let start = trimStart, length = trimEnd - trimStart
         func args(_ encoder: [String], decode: [String] = []) -> [String] {
             var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode
@@ -678,7 +726,9 @@ final class CropModel: ObservableObject {
             if cropIt {
                 // Change-only encoding: frames identical to the previous one (inside the crop) are not
                 // re-encoded; the previous frame just stays on screen longer. At least one frame per second is kept.
-                a += ["-vf", filter + ",mpdecimate=hi=256:lo=128:frac=0.1:max=30", "-fps_mode", "vfr"]
+                a += ["-vf", (look.map { $0 + "," } ?? "") + "mpdecimate=hi=256:lo=128:frac=0.1:max=30"
+                      + (abs(sp - 1) > 0.001 ? String(format: ",setpts=PTS/%.4f", sp) : ""), "-fps_mode", "vfr"]
+                if abs(sp - 1) > 0.001 { a += ["-af", String(format: "atempo=%.4f", sp)] }
             }
             return a + encoder + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path]
         }
@@ -700,7 +750,7 @@ final class CropModel: ObservableObject {
     }
 
     private func run(_ exe: URL, _ args: [String], trackProgress: Bool = false) async -> Int32 {
-        let total = isTrimmed ? trimEnd - trimStart : duration
+        let total = (isTrimmed ? trimEnd - trimStart : duration) / speed
         return await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
             let p = Process()
             p.executableURL = exe
@@ -757,6 +807,9 @@ struct CropView: View {
                 }
                 .frame(width: 170)
                 .disabled(model.url == nil || model.busy)
+                Button("Add Blur") { model.addBlur() }
+                    .disabled(model.url == nil || model.busy)
+                    .help("Adds a box that blurs that part of the picture, e.g. a name, a face or a patient ID. Drag it into place; × removes it.")
                 Button("Reset") { model.reset() }.disabled(model.url == nil || model.busy)
             }
 
@@ -789,6 +842,13 @@ struct CropView: View {
                 TrimBar(start: model.trimStart, end: model.trimEnd, duration: model.duration, playhead: model.time)
                     .frame(height: 8)
                 HStack(spacing: 10) {
+                    Picker("Speed", selection: $model.speed) {
+                        Text("1×").tag(1.0); Text("1.25×").tag(1.25); Text("1.5×").tag(1.5)
+                        Text("1.75×").tag(1.75); Text("2×").tag(2.0)
+                    }
+                    .frame(width: 130)
+                    .disabled(model.busy)
+                    .help("Saves the video faster, with voices kept at their normal pitch.")
                     Button("Set Start") { model.setStart() }.disabled(model.busy)
                     Button("Set End") { model.setEnd() }.disabled(model.busy)
                     if model.isTrimmed {
@@ -800,8 +860,12 @@ struct CropView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Text(model.isCropped
-                     ? "Saving rebuilds the video: the cropped-out area is permanently removed and cuts are exact. This takes a few minutes for long videos."
+                if !model.blurs.isEmpty {
+                    Text("Blur boxes stay in the same spot for the whole video; they don't follow a face that moves.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text(model.isCropped || model.hasEffects
+                     ? "Saving rebuilds the video: cropped-out and blurred areas are permanently removed, and cuts are exact. This takes a few minutes for long videos."
                      : "Trim only: saves in seconds. The cut starts at the nearest keyframe, up to a few seconds early.")
                     .font(.caption).foregroundStyle(.secondary)
 
@@ -875,6 +939,25 @@ struct CropCanvas: View {
                     .frame(width: fit.width, height: fit.height)
                     .offset(x: fit.minX, y: fit.minY)
 
+                // Blur boxes: a live preview of the blur, plus handles to move and resize, and × to remove.
+                ForEach(model.blurs.indices, id: \.self) { i in
+                    let b = model.blurs[i]
+                    let bb = CGRect(x: fit.minX + b.minX * fit.width, y: fit.minY + b.minY * fit.height,
+                                    width: b.width * fit.width, height: b.height * fit.height)
+                    ZStack(alignment: .topLeading) {
+                        Image(decorative: image, scale: 1)
+                            .resizable()
+                            .frame(width: fit.width, height: fit.height)
+                            .blur(radius: 14, opaque: true)
+                            .offset(x: fit.minX, y: fit.minY)
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+                    .mask(alignment: .topLeading) {
+                        Rectangle().frame(width: bb.width, height: bb.height).offset(x: bb.minX, y: bb.minY)
+                    }
+                    .allowsHitTesting(false)
+                }
+
                 // Darken everything outside the crop box.
                 Path { p in
                     p.addRect(fit)
@@ -907,6 +990,52 @@ struct CropCanvas: View {
                     }
                     .onEnded { _ in dragStart = nil })
                 .disabled(model.busy)
+
+                ForEach(model.blurs.indices, id: \.self) { i in
+                    let b = model.blurs[i]
+                    let bb = CGRect(x: fit.minX + b.minX * fit.width, y: fit.minY + b.minY * fit.height,
+                                    width: b.width * fit.width, height: b.height * fit.height)
+                    ZStack {
+                        Rectangle().fill(Color.white.opacity(0.001))
+                        Rectangle().stroke(Color.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                    }
+                    .frame(width: bb.width, height: bb.height)
+                    .offset(x: bb.minX, y: bb.minY)
+                    .gesture(DragGesture(minimumDistance: 1)
+                        .onChanged { v in
+                            guard i < model.blurs.count else { return }
+                            let start = dragStart ?? model.blurs[i]
+                            dragStart = start
+                            model.blurs[i] = model.moved(from: start, dx: v.translation.width / fit.width,
+                                                         dy: v.translation.height / fit.height)
+                        }
+                        .onEnded { _ in dragStart = nil })
+                    .disabled(model.busy)
+                    ForEach([CropHandle.topLeft, .topRight, .bottomLeft, .bottomRight], id: \.self) { h in
+                        Circle().fill(Color.orange)
+                            .frame(width: 12, height: 12)
+                            .contentShape(Rectangle().inset(by: -8))
+                            .position(x: bb.minX + h.anchor.x * bb.width, y: bb.minY + h.anchor.y * bb.height)
+                            .gesture(DragGesture(minimumDistance: 0)
+                                .onChanged { v in
+                                    guard i < model.blurs.count else { return }
+                                    let start = dragStart ?? model.blurs[i]
+                                    dragStart = start
+                                    model.blurs[i] = model.resizedFree(from: start, handle: h,
+                                                                       dx: v.translation.width / fit.width,
+                                                                       dy: v.translation.height / fit.height)
+                                }
+                                .onEnded { _ in dragStart = nil })
+                            .disabled(model.busy)
+                    }
+                    Button { if i < model.blurs.count { model.blurs.remove(at: i) } } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 16))
+                            .foregroundStyle(.white, .orange)
+                    }
+                    .buttonStyle(.plain)
+                    .position(x: bb.maxX + 10, y: bb.minY - 10)
+                    .disabled(model.busy)
+                }
 
                 ForEach(CropHandle.allCases, id: \.self) { h in
                     let size: CGFloat = h.isCorner ? 16 : 12
