@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pare secure save</title>
+<!-- Runs the same engine as the Pare PDF "Crop & Trim Video" tool, so timings match the website. -->
+<script type="module">
+import { inspectVideo, secureEditVideo } from './mp4edit.js';
+const post = (m) => window.webkit.messageHandlers.pare.postMessage(m);
+
+// Reads the video from Pare Reels' private local server, like a File would.
+class RemoteFile {
+  constructor(size) { this.size = size; }
+  slice(a, b) {
+    const end = Math.min(b ?? this.size, this.size);
+    return {
+      arrayBuffer: async () => {
+        if (end <= a) return new ArrayBuffer(0);
+        const r = await fetch('video', { headers: { Range: `bytes=${a}-${end - 1}` }, cache: 'no-store' });
+        if (!r.ok) throw new Error('Could not read the video (' + r.status + ')');
+        return r.arrayBuffer();
+      },
+    };
+  }
+}
+
+window.startJob = async (job) => {
+  try {
+    const file = new RemoteFile(job.size);
+    const info = await inspectVideo(file);
+    const t0 = performance.now();
+    const r = await secureEditVideo(file, info, {
+      crop: job.crop, start: job.start, end: job.end,
+      onProgress: (p) => post({ type: 'progress', value: p }),
+    });
+    post({ type: 'encoded', ms: Math.round(performance.now() - t0), encoder: r.encoder, bytes: r.blob.size });
+    const up = await fetch('upload', { method: 'PUT', body: r.blob });
+    if (!up.ok) throw new Error('Saving the file failed (' + up.status + ')');
+    post({ type: 'saved' });
+  } catch (e) {
+    post({ type: 'error', message: String((e && e.message) || e) });
+  }
+};
+post({ type: 'ready', webcodecs: typeof VideoEncoder !== 'undefined' });
+</script>

@@ -193,9 +193,14 @@ final class CropModel: ObservableObject {
 
     // MARK: Saving
 
+    enum SaveMethod: String { case instant = "instant", fast = "fast", secure = "secure" }
+    private var method: SaveMethod = .instant
+    let secure = SecureSaver()
+
     func cancel() {
         cancelled = true
         process?.terminate()
+        if method == .secure { secure.cancel() }
     }
 
     private var suffix: String {
@@ -211,11 +216,12 @@ final class CropModel: ObservableObject {
         if !FileManager.default.isWritableFile(atPath: dir.path) {
             dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
-        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix))"
+        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix), \(method.rawValue))"
         return DownloadModel.uniqueURL(in: dir, name: base, ext: ext)
     }
 
-    func save(instant: Bool) {
+    func save(_ how: SaveMethod) {
+        let instant = how == .instant
         guard let src = url, !busy else { return }
         guard isCropped || isTrimmed || !instant else {
             status = "Nothing to change yet. Drag the crop handles or set a start or end point."
@@ -225,24 +231,51 @@ final class CropModel: ObservableObject {
             status = "ffmpeg isn't installed yet. Open the Download tab once so Pare Reels can fetch it."
             return
         }
+        method = how
         busy = true; cancelled = false; savedFile = nil
         progress = instant ? nil : 0
-        status = instant ? "Saving (instant)…" : "Saving (fast re-encode)…"
+        status = ["instant": "Saving (instant)…", "fast": "Saving (fast, Mac hardware)…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
         let rect = pixelRect
+        let started = Date()
         Task {
-            let result = instant ? await saveInstant(src: src, ff: ff, rect: rect)
-                                 : await saveFast(src: src, ff: ff, rect: rect)
+            var note = ""
+            var result: URL?
+            switch how {
+            case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
+            case .fast: result = await saveFast(src: src, ff: ff, rect: rect)
+            case .secure:
+                let out = outputURL(for: src, ext: "mp4")
+                secure.onProgress = { [weak self] p in self?.progress = p }
+                switch await secure.run(src: src, crop: isCropped ? rect : nil,
+                                        start: isTrimmed ? trimStart : 0, end: isTrimmed ? trimEnd : duration, output: out) {
+                case .saved(let jsMs, let enc):
+                    result = out
+                    note = " Browser engine: \(String(format: "%.1f", Double(jsMs) / 1000)) s, encoder \(enc)."
+                case .failed(let message):
+                    try? FileManager.default.removeItem(at: out)
+                    note = message
+                case .cancelled:
+                    try? FileManager.default.removeItem(at: out)
+                }
+            }
+            let secs = Date().timeIntervalSince(started)
             busy = false
             progress = nil
             if cancelled {
                 status = "Cancelled."
             } else if let out = result {
                 savedFile = out
-                status = "Saved “\(out.lastPathComponent)”."
+                let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
+                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs)) · \(String(format: "%.0f", mb)) MB.\(note)"
             } else {
-                status = instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
+                status = how == .secure ? "Secure save failed: \(note)"
+                    : instant ? "Instant save didn't work for this file. Try Fast instead." : "Saving failed. See details in the Download tab's Log."
             }
         }
+    }
+
+    static func duration(_ s: Double) -> String {
+        s < 60 ? String(format: "%.1f s", s) : String(format: "%d min %02d s", Int(s) / 60, Int(s) % 60)
     }
 
     private func saveInstant(src: URL, ff: URL, rect: CGRect) async -> URL? {
@@ -410,9 +443,11 @@ struct CropView: View {
                         }
                         Button("Cancel") { model.cancel() }
                     } else {
-                        Button("Save — Fast") { model.save(instant: false) }
+                        Button("Save — Secure") { model.save(.secure) }
+                            .help("Runs the Pare PDF browser engine on this Mac: re-encodes, removes cropped edges permanently, exact trims. For timing the website version.")
+                        Button("Save — Fast") { model.save(.fast) }
                             .help("Re-encodes with your Mac's video hardware. Works everywhere, smaller file. A few minutes for an hour of video.")
-                        Button("Save — Instant") { model.save(instant: true) }
+                        Button("Save — Instant") { model.save(.instant) }
                             .keyboardShortcut(.defaultAction)
                             .disabled(!model.canInstant)
                             .help(model.canInstant
@@ -434,6 +469,7 @@ struct CropView: View {
             }
         }
         .padding(20)
+        .background(alignment: .bottomLeading) { SecureHost(saver: model.secure).frame(width: 2, height: 2).opacity(0.02) }
     }
 
     private func timeString(_ s: Double) -> String {
