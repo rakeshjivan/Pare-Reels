@@ -60,6 +60,8 @@ final class CropModel: ObservableObject {
     @Published var rotated = false
     @Published var busy = false
     @Published var progress: Double?
+    @Published var liveInfo: String?          // e.g. "14× · about 8 min left"
+    private var fastEncoder = ""
     @Published var status: String?
     @Published var savedFile: URL?
 
@@ -232,6 +234,7 @@ final class CropModel: ObservableObject {
             return
         }
         method = how
+        liveInfo = nil
         busy = true; cancelled = false; savedFile = nil
         progress = instant ? nil : 0
         status = ["instant": "Saving (instant)…", "fast": "Saving (fast, Mac hardware)…", "secure": "Saving (secure, browser engine)…"][how.rawValue]
@@ -242,7 +245,9 @@ final class CropModel: ObservableObject {
             var result: URL?
             switch how {
             case .instant: result = await saveInstant(src: src, ff: ff, rect: rect)
-            case .fast: result = await saveFast(src: src, ff: ff, rect: rect)
+            case .fast:
+                result = await saveFast(src: src, ff: ff, rect: rect)
+                note = " Encoder: \(fastEncoder)."
             case .secure:
                 let out = outputURL(for: src, ext: "mp4")
                 secure.onProgress = { [weak self] p in self?.progress = p }
@@ -261,6 +266,7 @@ final class CropModel: ObservableObject {
             let secs = Date().timeIntervalSince(started)
             busy = false
             progress = nil
+            liveInfo = nil
             if cancelled {
                 status = "Cancelled."
             } else if let out = result {
@@ -315,8 +321,8 @@ final class CropModel: ObservableObject {
         let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY))"
         let cropIt = isCropped, trimIt = isTrimmed
         let start = trimStart, length = trimEnd - trimStart
-        func args(_ encoder: [String]) -> [String] {
-            var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+        func args(_ encoder: [String], decode: [String] = []) -> [String] {
+            var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode
             if trimIt && start > 0 { a += ["-ss", String(format: "%.3f", start)] }   // exact when re-encoding
             a += ["-i", src.path]
             if trimIt { a += ["-t", String(format: "%.3f", length)] }
@@ -324,13 +330,18 @@ final class CropModel: ObservableObject {
             if cropIt { a += ["-vf", filter] }
             return a + encoder + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path]
         }
-        // Mac hardware encoder first; the software encoder only if that's unavailable.
-        var code = await run(ff, args(["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]), trackProgress: true)
-        if code != 0, !cancelled {
-            code = await run(ff, args(["-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1"]), trackProgress: true)
-        }
-        if code != 0, !cancelled {
-            code = await run(ff, args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]), trackProgress: true)
+        // Fastest first: hardware decode + hardware encode tuned for speed. Software only as a last resort.
+        let attempts: [(String, [String], [String])] = [
+            ("Mac hardware decode + encode", ["-hwaccel", "videotoolbox"], ["-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65"]),
+            ("Mac hardware encode", [], ["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]),
+            ("Mac hardware encode (bitrate)", [], ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1"]),
+            ("software encoder (slow)", [], ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
+        ]
+        var code: Int32 = -1
+        for (label, decode, enc) in attempts {
+            fastEncoder = label
+            code = await run(ff, args(enc, decode: decode), trackProgress: true)
+            if code == 0 || cancelled { break }
         }
         if code != 0 || cancelled { try? FileManager.default.removeItem(at: out); return nil }
         return out
@@ -345,11 +356,20 @@ final class CropModel: ObservableObject {
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
+            final class Box: @unchecked Sendable { var done = 0.0 }
+            let box = Box()
             let splitter = LineSplitter { [weak self] line in
-                guard trackProgress, line.hasPrefix("out_time_us="), total > 0,
-                      let us = Double(line.dropFirst("out_time_us=".count)) else { return }
-                let frac = min(max(us / 1_000_000 / total, 0), 1)
-                Task { @MainActor in self?.progress = frac }
+                guard trackProgress, total > 0 else { return }
+                if line.hasPrefix("out_time_us="), let us = Double(line.dropFirst("out_time_us=".count)) {
+                    box.done = us / 1_000_000
+                    let frac = min(max(box.done / total, 0), 1)
+                    Task { @MainActor in self?.progress = frac }
+                } else if line.hasPrefix("speed="), let sp = Double(line.dropFirst(6).replacingOccurrences(of: "x", with: "").trimmingCharacters(in: .whitespaces)), sp > 0 {
+                    let left = max(0, total - box.done) / sp
+                    let eta = left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left"
+                    let text = String(format: "%.1f×", sp) + " · " + eta
+                    Task { @MainActor in self?.liveInfo = text }
+                }
             }
             pipe.fileHandleForReading.readabilityHandler = { h in
                 let d = h.availableData
@@ -438,6 +458,7 @@ struct CropView: View {
                         if let p = model.progress {
                             ProgressView(value: p).frame(width: 160)
                             Text("\(Int(p * 100))%").monospacedDigit().foregroundStyle(.secondary)
+                            if let info = model.liveInfo { Text(info).monospacedDigit().foregroundStyle(.secondary) }
                         } else {
                             ProgressView().controlSize(.small)
                         }
