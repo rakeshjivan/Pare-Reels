@@ -204,6 +204,7 @@ final class CropModel: ObservableObject {
     func cancel() {
         cancelled = true
         process?.terminate()
+        extraProcesses.forEach { $0.terminate() }
         exportSession?.cancelExport()
         if method == .secure { secure.cancel() }
     }
@@ -253,8 +254,11 @@ final class CropModel: ObservableObject {
                 result = await saveInstant(src: src, ff: ff, rect: rect)
                 note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
             case .fast:
-                // Main engine: ffmpeg with the Mac's hardware decoder and encoder (reports true speed).
-                if let r = await saveFast(src: src, ff: ff, rect: rect) {
+                // Main engine: parts side by side, change-only encoding, Mac hardware.
+                if let r = await saveParallel(src: src, ff: ff, rect: rect) {
+                    result = r
+                    note = " Engine: \(fastEncoder)."
+                } else if !cancelled, let r = await saveFast(src: src, ff: ff, rect: rect) {
                     result = r
                     note = " Engine: \(fastEncoder)."
                 } else if !cancelled, let r = await saveApple(src: src, rect: rect) {
@@ -388,6 +392,107 @@ final class CropModel: ObservableObject {
         exportError = ex.error?.localizedDescription ?? "status \(ex.status.rawValue)"
         try? FileManager.default.removeItem(at: out)
         return nil
+    }
+
+    private var extraProcesses: [Process] = []
+
+    /// Runs one ffmpeg job and reports how far through its media it is (seconds).
+    private func runTracked(_ exe: URL, _ args: [String], onTime: @escaping @Sendable (Double) -> Void) async -> Int32 {
+        await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
+            let p = Process()
+            p.executableURL = exe
+            p.arguments = args
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            let splitter = LineSplitter { line in
+                if line.hasPrefix("out_time_us="), let us = Double(line.dropFirst("out_time_us=".count)) { onTime(us / 1_000_000) }
+            }
+            pipe.fileHandleForReading.readabilityHandler = { h in
+                let d = h.availableData
+                if d.isEmpty { h.readabilityHandler = nil } else { splitter.feed(d) }
+            }
+            p.terminationHandler = { proc in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                cont.resume(returning: proc.terminationStatus)
+            }
+            do { try p.run(); extraProcesses.append(p) } catch { cont.resume(returning: -1) }
+        }
+    }
+
+    /// Crop save for long videos: split into parts, process them side by side with change-only
+    /// encoding on the Mac's video hardware, then join losslessly and add the original sound.
+    private func saveParallel(src: URL, ff: URL, rect: CGRect) async -> URL? {
+        let mediaLen = isTrimmed ? trimEnd - trimStart : duration
+        let start = isTrimmed ? trimStart : 0
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let n = mediaLen < 180 ? 1 : min(4, max(2, cores / 2))
+        guard n > 1 else { return nil }
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-parts-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+        let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY)),mpdecimate=hi=256:lo=128:frac=0.1:max=30"
+        fastEncoder = "Mac hardware, change-only encoding, \(n) parts side by side"
+
+        final class Done: @unchecked Sendable { var seconds = 0.0 }
+        let done = (0..<n).map { _ in Done() }
+        var parts: [(URL, Double)] = []
+        var jobs: [[String]] = []
+        for i in 0..<n {
+            let a = start + Double(i) * mediaLen / Double(n)
+            let b = i == n - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(n)
+            let out = work.appendingPathComponent("part\(i).mp4")
+            parts.append((out, b - a))
+            jobs.append(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-hwaccel", "videotoolbox",
+                         "-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
+                         "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
+                         "-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65", out.path])
+        }
+
+        let started = Date()
+        let poll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let sum = done.map(\.seconds).reduce(0, +)
+                let elapsed = Date().timeIntervalSince(started)
+                self?.progress = min(0.98, sum / mediaLen)
+                if elapsed > 20, sum > 0 {
+                    let speed = sum / elapsed, left = (mediaLen - sum) / speed
+                    self?.liveInfo = String(format: "%.1f× · %d parts · ", speed, n)
+                        + (left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left")
+                } else {
+                    self?.liveInfo = "estimating time…"
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        var codes: [Int32] = []
+        await withTaskGroup(of: Int32.self) { group in
+            for i in 0..<n {
+                let args = jobs[i], counter = done[i]
+                group.addTask { await self.runTracked(ff, args) { s in counter.seconds = s } }
+            }
+            for await c in group { codes.append(c) }
+        }
+        poll.cancel()
+        extraProcesses = []
+        if cancelled || codes.contains(where: { $0 != 0 }) { return nil }
+
+        // Join the parts (each told its exact length so the timing never drifts) and add the original sound.
+        liveInfo = "joining parts…"
+        let list = work.appendingPathComponent("parts.txt")
+        let text = parts.map { "file '\($0.0.path.replacingOccurrences(of: "'", with: "'\\''"))'\nduration \(String(format: "%.3f", $0.1))" }
+            .joined(separator: "\n")
+        try? text.write(to: list, atomically: true, encoding: .utf8)
+        let out = outputURL(for: src, ext: "mp4")
+        var args = ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list.path]
+        if start > 0 { args += ["-ss", String(format: "%.3f", start)] }
+        args += ["-t", String(format: "%.3f", mediaLen), "-i", src.path,
+                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-movflags", "+faststart", out.path]
+        let code = await run(ff, args)
+        progress = 1
+        if code != 0 || cancelled { try? FileManager.default.removeItem(at: out); return nil }
+        return out
     }
 
     private func saveFast(src: URL, ff: URL, rect: CGRect) async -> URL? {
