@@ -34,6 +34,8 @@ enum MediaKind: Int, Comparable {
 
         if ends([".m3u8", ".mpd"]) || lower.contains(".m3u8") || lower.contains("format=m3u8") { return .manifest }
         if ends([".ts", ".m4s", ".cmfv", ".cmfa"]) { return .segment }
+        // Byte-range pieces of a stream (Vimeo and others) are not whole files.
+        if lower.contains("/range/") || lower.contains("range=") || lower.contains("bytes=") { return .segment }
         let range = NSRange(path.startIndex..., in: path)
         if segmentPattern.firstMatch(in: path, range: range) != nil { return .segment }
         if ends([".m4a", ".mp3", ".aac", ".opus", ".oga", ".weba"]) || lower.contains("mime=audio") { return .audio }
@@ -143,17 +145,42 @@ final class MediaFinder: ObservableObject {
         new PerformanceObserver(function(list){ list.getEntries().forEach(function(e){ report(e.name); }); })
           .observe({type: 'resource', buffered: true});
       } catch(e) {}
+      // Vimeo's player config lists the streams, including one HLS link with picture + sound.
+      function fromVimeoConfig(cfg){
+        try {
+          var files = cfg && cfg.request && cfg.request.files;
+          var hls = files && files.hls;
+          if (hls && hls.cdns) {
+            var order = [hls.default_cdn].concat(Object.keys(hls.cdns));
+            for (var i = 0; i < order.length; i++) {
+              var c = hls.cdns[order[i]];
+              if (c && c.url) { report(c.url); break; }
+            }
+          }
+          (files && files.progressive || []).forEach(function(p){ if (p && p.url) report(p.url); });
+        } catch(e) {}
+      }
+      function maybeConfig(url, text){
+        if (!url || String(url).indexOf('vimeo') < 0 || String(url).indexOf('config') < 0) return;
+        try { fromVimeoConfig(JSON.parse(text)); } catch(e) {}
+      }
       var f = window.fetch;
       if (f) window.fetch = function(input){
-        try { report(typeof input === 'string' ? input : (input && input.url)); } catch(e) {}
-        return f.apply(this, arguments);
+        var u = typeof input === 'string' ? input : (input && input.url);
+        try { report(u); } catch(e) {}
+        var p = f.apply(this, arguments);
+        try { p.then(function(r){ if (String(u).indexOf('config') >= 0) r.clone().text().then(function(t){ maybeConfig(u, t); }); }).catch(function(){}); } catch(e) {}
+        return p;
       };
       var open = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url){
         try { report(String(url)); } catch(e) {}
+        var xhr = this;
+        try { xhr.addEventListener('load', function(){ try { maybeConfig(String(url), xhr.responseText); } catch(e) {} }); } catch(e) {}
         return open.apply(this, arguments);
       };
       setInterval(function(){
+        if (window.playerConfig) fromVimeoConfig(window.playerConfig);
         document.querySelectorAll('video,audio,source').forEach(function(el){
           report(el.currentSrc || el.src);
         });
