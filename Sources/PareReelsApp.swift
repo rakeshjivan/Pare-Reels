@@ -18,7 +18,7 @@ struct PareReelsApp: App {
                 ContentView()
                     .tabItem { Label("Download", systemImage: "arrow.down.circle") }
                 CropView()
-                    .tabItem { Label("Crop", systemImage: "crop") }
+                    .tabItem { Label("Crop & Trim", systemImage: "crop") }
             }
                 .environmentObject(model)
                 .frame(minWidth: 720, minHeight: 640)

@@ -52,6 +52,8 @@ final class CropModel: ObservableObject {
     @Published var frame: CGImage?
     @Published var duration: Double = 0
     @Published var time: Double = 0
+    @Published var trimStart: Double = 0
+    @Published var trimEnd: Double = 0
     @Published var crop = CGRect(x: 0, y: 0, width: 1, height: 1)   // 0...1 of the frame
     @Published var aspect: CropAspect = .free { didSet { applyAspect() } }
     @Published var codec = ""
@@ -66,7 +68,14 @@ final class CropModel: ObservableObject {
     private var process: Process?
     private var cancelled = false
 
-    var canInstant: Bool { (codec == "h264" || codec == "hevc") && !rotated }
+    var isCropped: Bool { crop.minX > 0.001 || crop.minY > 0.001 || crop.width < 0.999 || crop.height < 0.999 }
+    var isTrimmed: Bool { trimStart > 0.05 || trimEnd < duration - 0.05 }
+    /// Trimming alone works on any video; cropping instantly needs H.264/HEVC that isn't rotated.
+    var canInstant: Bool { !isCropped || ((codec == "h264" || codec == "hevc") && !rotated) }
+
+    func setStart() { trimStart = min(time, max(0, trimEnd - 0.5)) }
+    func setEnd() { trimEnd = max(time, min(duration, trimStart + 0.5)) }
+    func clearTrim() { trimStart = 0; trimEnd = duration }
 
     var pixelRect: CGRect {
         // Whole, even pixel values (needed by the video formats).
@@ -125,6 +134,8 @@ final class CropModel: ObservableObject {
         self.url = url
         crop = CGRect(x: 0, y: 0, width: 1, height: 1)
         applyAspect()
+        trimStart = 0
+        trimEnd = duration
         time = min(duration * 0.1, 10)
         await refreshFrame()
     }
@@ -187,17 +198,29 @@ final class CropModel: ObservableObject {
         process?.terminate()
     }
 
+    private var suffix: String {
+        switch (isCropped, isTrimmed) {
+        case (true, true): return "edited"
+        case (false, true): return "trimmed"
+        default: return "cropped"
+        }
+    }
+
     private func outputURL(for src: URL, ext: String) -> URL {
         var dir = src.deletingLastPathComponent()
         if !FileManager.default.isWritableFile(atPath: dir.path) {
             dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
-        let base = src.deletingPathExtension().lastPathComponent + " (cropped)"
+        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix))"
         return DownloadModel.uniqueURL(in: dir, name: base, ext: ext)
     }
 
     func save(instant: Bool) {
         guard let src = url, !busy else { return }
+        guard isCropped || isTrimmed || !instant else {
+            status = "Nothing to change yet. Drag the crop handles or set a start or end point."
+            return
+        }
         guard let ff = Tools.find("ffmpeg") else {
             status = "ffmpeg isn't installed yet. Open the Download tab once so Pare Reels can fetch it."
             return
@@ -237,12 +260,18 @@ final class CropModel: ObservableObject {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("pare-crop-\(UUID().uuidString).\(ext)")
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        // Pass 1: change the crop inside the video stream (no re-encoding).
-        guard await run(ff, ["-y", "-loglevel", "error", "-i", src.path, "-map", "0:v:0", "-map", "0:a?",
-                             "-c", "copy", "-bsf:v", bsf, tmp.path]) == 0, !cancelled else { return nil }
+        // Pass 1: cut to the chosen range and change the crop inside the video stream (no re-encoding).
+        var a1 = ["-y", "-loglevel", "error"]
+        if isTrimmed && trimStart > 0 { a1 += ["-ss", String(format: "%.3f", trimStart)] }
+        a1 += ["-i", src.path]
+        if isTrimmed { a1 += ["-t", String(format: "%.3f", trimEnd - trimStart)] }
+        a1 += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy"]
+        if isCropped { a1 += ["-bsf:v", bsf] }
+        a1 += ["-avoid_negative_ts", "make_zero", tmp.path]
+        guard await run(ff, a1) == 0, !cancelled else { return nil }
         // Pass 2: rewrite the file so its stated size matches the new picture.
         var args = ["-y", "-loglevel", "error", "-i", tmp.path, "-map", "0", "-c", "copy"]
-        if codec == "hevc" { args += ["-tag:v", "hvc1"] }
+        if codec == "hevc" && isCropped { args += ["-tag:v", "hvc1"] }
         args += ["-movflags", "+faststart", out.path]
         guard await run(ff, args) == 0, !cancelled else { try? FileManager.default.removeItem(at: out); return nil }
         return out
@@ -251,10 +280,16 @@ final class CropModel: ObservableObject {
     private func saveFast(src: URL, ff: URL, rect: CGRect) async -> URL? {
         let out = outputURL(for: src, ext: "mp4")
         let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY))"
+        let cropIt = isCropped, trimIt = isTrimmed
+        let start = trimStart, length = trimEnd - trimStart
         func args(_ encoder: [String]) -> [String] {
-            ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
-             "-i", src.path, "-map", "0:v:0", "-map", "0:a?", "-vf", filter]
-            + encoder + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path]
+            var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+            if trimIt && start > 0 { a += ["-ss", String(format: "%.3f", start)] }   // exact when re-encoding
+            a += ["-i", src.path]
+            if trimIt { a += ["-t", String(format: "%.3f", length)] }
+            a += ["-map", "0:v:0", "-map", "0:a?"]
+            if cropIt { a += ["-vf", filter] }
+            return a + encoder + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.path]
         }
         // Mac hardware encoder first; the software encoder only if that's unavailable.
         var code = await run(ff, args(["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]), trackProgress: true)
@@ -269,7 +304,7 @@ final class CropModel: ObservableObject {
     }
 
     private func run(_ exe: URL, _ args: [String], trackProgress: Bool = false) async -> Int32 {
-        let total = duration
+        let total = isTrimmed ? trimEnd - trimStart : duration
         return await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
             let p = Process()
             p.executableURL = exe
@@ -343,12 +378,28 @@ struct CropView: View {
                         .onChange(of: model.time) { _ in Task { await model.refreshFrame() } }
                     Text(timeString(model.duration)).monospacedDigit().foregroundStyle(.secondary)
                 }
-                Text("Drag the slider to check the crop works for the whole video.")
-                    .font(.caption).foregroundStyle(.secondary)
+                TrimBar(start: model.trimStart, end: model.trimEnd, duration: model.duration, playhead: model.time)
+                    .frame(height: 8)
+                HStack(spacing: 10) {
+                    Button("Set Start") { model.setStart() }.disabled(model.busy)
+                    Button("Set End") { model.setEnd() }.disabled(model.busy)
+                    if model.isTrimmed {
+                        Button("Clear Trim") { model.clearTrim() }.disabled(model.busy)
+                        Text("Keep \(timeString(model.trimStart)) – \(timeString(model.trimEnd))  (\(timeString(model.trimEnd - model.trimStart)))")
+                            .monospacedDigit().foregroundStyle(.secondary)
+                    } else {
+                        Text("To trim: move the slider, then Set Start / Set End.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if model.isTrimmed {
+                    Text("Instant cuts start at the nearest keyframe, so they may begin up to a few seconds early. Use Fast for an exact cut.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
 
                 HStack(spacing: 12) {
                     let r = model.pixelRect
-                    Text("\(Int(r.width)) × \(Int(r.height))").monospacedDigit()
+                    Text(model.isCropped ? "\(Int(r.width)) × \(Int(r.height))" : "Full frame").monospacedDigit()
                     Spacer()
                     if model.busy {
                         if let p = model.progress {
@@ -366,7 +417,7 @@ struct CropView: View {
                             .disabled(!model.canInstant)
                             .help(model.canInstant
                                   ? "No re-encoding: done in seconds with no quality loss."
-                                  : "Not available for this video (rotated, or not H.264/HEVC). Use Fast.")
+                                  : "Instant crop isn't available for this video (rotated, or not H.264/HEVC). Use Fast.")
                     }
                 }
                 .controlSize(.large)
@@ -473,5 +524,24 @@ struct CropCanvas: View {
         let scale = min(container.width / content.width, container.height / content.height)
         let w = content.width * scale, h = content.height * scale
         return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+    }
+}
+
+/// The kept part of the video, shown under the time slider.
+struct TrimBar: View {
+    let start: Double, end: Double, duration: Double, playhead: Double
+
+    var body: some View {
+        GeometryReader { g in
+            let d = max(duration, 0.001)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.2))
+                Capsule().fill(Color.accentColor.opacity(0.7))
+                    .frame(width: max(2, g.size.width * CGFloat((end - start) / d)))
+                    .offset(x: g.size.width * CGFloat(start / d))
+                Rectangle().fill(Color.primary).frame(width: 2)
+                    .offset(x: g.size.width * CGFloat(min(playhead, d) / d) - 1)
+            }
+        }
     }
 }
