@@ -426,13 +426,17 @@ final class CropModel: ObservableObject {
         let mediaLen = isTrimmed ? trimEnd - trimStart : duration
         let start = isTrimmed ? trimStart : 0
         let cores = ProcessInfo.processInfo.activeProcessorCount
-        let n = mediaLen < 180 ? 1 : min(4, max(2, cores / 2))
+        // The Mac's video hardware decodes up to 4 parts; extra parts are decoded by the
+        // processor cores, which would otherwise sit idle.
+        let n = mediaLen < 180 ? 1 : min(8, max(2, cores - 2))
+        let hwParts = min(n, 4)
         guard n > 1 else { return nil }
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-parts-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
         let filter = "crop=\(Int(rect.width)):\(Int(rect.height)):\(Int(rect.minX)):\(Int(rect.minY)),mpdecimate=hi=256:lo=128:frac=0.1:max=30"
         fastEncoder = "Mac hardware, change-only encoding, \(n) parts side by side"
+            + (n > hwParts ? " (\(n - hwParts) decoded by the processor)" : "")
 
         final class Done: @unchecked Sendable { var seconds = 0.0 }
         let done = (0..<n).map { _ in Done() }
@@ -443,7 +447,9 @@ final class CropModel: ObservableObject {
             let b = i == n - 1 ? start + mediaLen : start + Double(i + 1) * mediaLen / Double(n)
             let out = work.appendingPathComponent("part\(i).mp4")
             parts.append((out, b - a))
-            jobs.append(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-hwaccel", "videotoolbox",
+            let hw = (i * hwParts) / n != ((i + 1) * hwParts) / n   // spread the hardware parts evenly
+            let decode = hw ? ["-hwaccel", "videotoolbox"] : ["-threads", "2"]
+            jobs.append(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + decode + [
                          "-ss", String(format: "%.3f", a), "-i", src.path, "-t", String(format: "%.3f", b - a),
                          "-map", "0:v:0", "-an", "-vf", filter, "-fps_mode", "vfr",
                          "-c:v", "h264_videotoolbox", "-prio_speed", "1", "-q:v", "65", out.path])

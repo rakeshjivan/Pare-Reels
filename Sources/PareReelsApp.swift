@@ -151,7 +151,10 @@ enum Tools {
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Pare Reels/bin", isDirectory: true)
 
-    static var ytdlp: URL { dir.appendingPathComponent("yt-dlp") }
+    /// yt-dlp as an unpacked folder: starts in a fraction of a second, where the single-file
+    /// version unpacks itself (and gets virus-scanned) every time it runs.
+    static var ytdlpHome: URL { dir.appendingPathComponent("yt-dlp-app", isDirectory: true) }
+    static var ytdlp: URL { ytdlpHome.appendingPathComponent("yt-dlp_macos") }
     /// Unfinished pieces of downloads live here, never in the user's Downloads folder.
     static let partsRoot: URL = FileManager.default
         .urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -166,7 +169,45 @@ enum Tools {
     static let ffArch = "amd64"
     #endif
 
-    static let ytdlpURL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+    static let ytdlpZip = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos.zip"
+
+    /// Newest yt-dlp version name (e.g. "2026.10.31"), read from where GitHub's "latest" link points.
+    static func latestYtdlpVersion() async -> String? {
+        var req = URLRequest(url: URL(string: "https://github.com/yt-dlp/yt-dlp/releases/latest")!)
+        req.httpMethod = "HEAD"; req.timeoutInterval = 15
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let tag = resp.url?.lastPathComponent, tag.first?.isNumber == true else { return nil }
+        return tag
+    }
+
+    /// Downloads the unpacked yt-dlp and swaps it in place in one step.
+    static func installYtdlp() async throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        let zip = work.appendingPathComponent("y.zip")
+        try await download(ytdlpZip, to: zip)
+        let out = work.appendingPathComponent("x")
+        _ = try runQuick("/usr/bin/ditto", ["-x", "-k", zip.path, out.path])
+        guard let exe = fm.enumerator(at: out, includingPropertiesForKeys: nil)?
+            .compactMap({ $0 as? URL })
+            .first(where: { $0.lastPathComponent == "yt-dlp_macos" }) else {
+            throw NSError(domain: "PareReels", code: 2, userInfo: [NSLocalizedDescriptionKey: "yt-dlp not found in download"])
+        }
+        let folder = exe.deletingLastPathComponent()
+        _ = try? runQuick("/usr/bin/xattr", ["-dr", "com.apple.quarantine", folder.path])
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+        let staged = dir.appendingPathComponent("yt-dlp-app.new", isDirectory: true)
+        try? fm.removeItem(at: staged)
+        try fm.moveItem(at: folder, to: staged)
+        let old = dir.appendingPathComponent("yt-dlp-app.old", isDirectory: true)
+        try? fm.removeItem(at: old)
+        if fm.fileExists(atPath: ytdlpHome.path) { try fm.moveItem(at: ytdlpHome, to: old) }
+        try fm.moveItem(at: staged, to: ytdlpHome)
+        try? fm.removeItem(at: old)
+        try? fm.removeItem(at: dir.appendingPathComponent("yt-dlp"))   // the old single-file version
+    }
     static func ffmpegZip(_ program: String) -> String {
         "https://ffmpeg.martin-riedl.de/redirect/latest/macos/\(ffArch)/release/\(program).zip"
     }
@@ -361,8 +402,7 @@ final class DownloadModel: ObservableObject {
                 await updateYtdlp()
             } else {
                 setupMessage = "Downloading yt-dlp (first launch only)…"
-                try await Tools.download(Tools.ytdlpURL, to: Tools.ytdlp)
-                Tools.makeRunnable(Tools.ytdlp)
+                try await Tools.installYtdlp()
             }
 
             if Tools.find("deno") == nil {
@@ -389,12 +429,13 @@ final class DownloadModel: ObservableObject {
         }
     }
 
+    /// The unpacked yt-dlp can't update itself, so the app replaces it when a newer one is out.
     private func updateYtdlp() async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global().async {
-                _ = try? Tools.runQuick(Tools.ytdlp.path, ["-U"])
-                c.resume()
-            }
+        guard let latest = await Tools.latestYtdlpVersion() else { return }
+        let (_, mine) = await Tools.capture(Tools.ytdlp.path, ["--version"])
+        if mine.trimmingCharacters(in: .whitespacesAndNewlines) != latest {
+            setupMessage = "Updating yt-dlp…"
+            try? await Tools.installYtdlp()
         }
     }
 
