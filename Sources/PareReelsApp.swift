@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // A downloaded update is swapped in as the app quits.
     func applicationWillTerminate(_ notification: Notification) {
+        Tools.stopBackgroundJobs()   // never leave ffmpeg/yt-dlp running after the app closes
         Updater.shared.install(relaunch: false)
     }
 }
@@ -228,6 +229,13 @@ enum Tools {
         }
     }
 
+    /// Stops video jobs this app started (they could otherwise keep the video hardware busy).
+    static func stopBackgroundJobs() {
+        for pattern in ["\(dir.path)/ffmpeg", "\(dir.path)/yt-dlp", "ffmpeg.*-progress pipe:1", "ffmpeg.*pare-crop-", "ffmpeg.*pare-parts-"] {
+            _ = try? runQuick("/usr/bin/pkill", ["-f", pattern])
+        }
+    }
+
     @discardableResult
     static func runQuick(_ exe: String, _ args: [String]) throws -> Int32 {
         let p = Process()
@@ -331,6 +339,7 @@ final class DownloadModel: ObservableObject {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: Tools.dir, withIntermediateDirectories: true)
+            Tools.stopBackgroundJobs()   // clean up anything left over from a previous session
 
             if fm.isExecutableFile(atPath: Tools.ytdlp.path) {
                 setupMessage = "Checking for updates…"

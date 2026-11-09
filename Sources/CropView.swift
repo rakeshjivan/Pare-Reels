@@ -370,7 +370,9 @@ final class CropModel: ObservableObject {
                 let p = Double(ex.progress)
                 self?.progress = p
                 let elapsed = Date().timeIntervalSince(started)
-                if p > 0.01, elapsed > 1 {
+                if elapsed < 30 || p < 0.02 {
+                    self?.liveInfo = "estimating time…"
+                } else {
                     let speed = p * mediaLen / elapsed
                     let left = elapsed * (1 - p) / p
                     self?.liveInfo = String(format: "%.1f×", speed) + " · " + (left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left")
@@ -427,7 +429,7 @@ final class CropModel: ObservableObject {
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
-            final class Box: @unchecked Sendable { var done = 0.0 }
+            final class Box: @unchecked Sendable { var done = 0.0; let started = Date() }
             let box = Box()
             let splitter = LineSplitter { [weak self] line in
                 guard trackProgress, total > 0 else { return }
@@ -438,7 +440,7 @@ final class CropModel: ObservableObject {
                 } else if line.hasPrefix("speed="), let sp = Double(line.dropFirst(6).replacingOccurrences(of: "x", with: "").trimmingCharacters(in: .whitespaces)), sp > 0 {
                     let left = max(0, total - box.done) / sp
                     let eta = left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left"
-                    let text = String(format: "%.1f×", sp) + " · " + eta
+                    let text = Date().timeIntervalSince(box.started) < 30 ? "estimating time…" : String(format: "%.1f×", sp) + " · " + eta
                     Task { @MainActor in self?.liveInfo = text }
                 }
             }
