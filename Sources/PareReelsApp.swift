@@ -276,12 +276,19 @@ final class DownloadModel: ObservableObject {
     private var lastFiles: [Int: String] = [:]
 
     /// Sites the downloader can't read, so we go straight to finding the file on the page.
-    static let finderHosts = ["gotowebinar.com", "goto.com", "gotomeeting.com", "gotostage.com", "gotowebinar.cn"]
+    /// Webinar platforms and course sites (lectures sit behind a login; without it the page
+    /// bounces to the school's homepage and the wrong video gets saved).
+    static let finderHosts = ["gotowebinar.com", "goto.com", "gotomeeting.com", "gotostage.com", "gotowebinar.cn",
+                              "teachable.com", "thinkific.com", "kajabi.com", "mykajabi.com", "podia.com",
+                              "learnworlds.com"]
+    static let youtubeHosts = ["youtube.com", "youtu.be", "youtube-nocookie.com"]
 
-    static func needsFinder(_ link: String) -> Bool {
+    static func host(_ link: String, in list: [String]) -> Bool {
         guard let host = URL(string: link)?.host?.lowercased() else { return false }
-        return finderHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+        return list.contains { host == $0 || host.hasSuffix("." + $0) }
     }
+
+    static func needsFinder(_ link: String) -> Bool { host(link, in: finderHosts) }
 
     init() {
         let d = UserDefaults.standard
@@ -479,7 +486,7 @@ final class DownloadModel: ObservableObject {
         current?.terminate()
     }
 
-    private func arguments(for item: DownloadItem) -> [String] {
+    private func arguments(for item: DownloadItem, useBrowserLogin: Bool = true) -> [String] {
         let url = item.url
         var a = [
             "--newline", "--color", "never", "--no-playlist",
@@ -510,7 +517,7 @@ final class DownloadModel: ObservableObject {
             }
         }
         // Logins
-        if let b = browser.ytdlpName { a += ["--cookies-from-browser", b] }
+        if useBrowserLogin, let b = browser.ytdlpName { a += ["--cookies-from-browser", b] }
         let c = item.credentials
         if !c.videoPassword.isEmpty { a += ["--video-password", c.videoPassword] }
         if !c.username.isEmpty { a += ["--username", c.username] }
@@ -533,6 +540,13 @@ final class DownloadModel: ObservableObject {
             try? FileManager.default.removeItem(at: job.cookiesFile)
         } else {
             ok = await runYtdlp(arguments(for: items[i]), index: i) == 0
+            // YouTube sometimes rejects a browser login: try once more without it.
+            if !ok, !cancelRequested, browser != .none, Self.host(items[i].url, in: Self.youtubeHosts) {
+                appendLog("Retrying without the browser login…")
+                lastErrors[i] = nil
+                items[i].detail = "Retrying…"
+                ok = await runYtdlp(arguments(for: items[i], useBrowserLogin: false), index: i) == 0
+            }
         }
 
         // Let any queued output lines land first.
@@ -549,7 +563,8 @@ final class DownloadModel: ObservableObject {
             items[i].status = .failed
             let c = items[i].credentials
             let typedCredentials = !c.videoPassword.isEmpty || !c.username.isEmpty
-            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err) || (isAuthError(err) && !typedCredentials)) {
+            let isYouTube = Self.host(items[i].url, in: Self.youtubeHosts)
+            if items[i].direct == nil && !isYouTube && (isFinderError(err) || needsRegistration(err) || (isAuthError(err) && !typedCredentials)) {
                 // The downloader can't get it on its own (e.g. Vimeo now wants a login):
                 // play the page in the finder window and take the file from there.
                 // The downloader can't read this page: look for the file on the page instead.

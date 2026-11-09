@@ -94,6 +94,9 @@ final class MediaFinder: ObservableObject {
     }
 
     func add(_ url: String) {
+        // YouTube's internal stream links only work inside its own player.
+        let l = url.lowercased()
+        if l.contains("googlevideo.com") || l.contains("youtube.com/") { return }
         guard url.lowercased().hasPrefix("http"),
               !candidates.contains(where: { $0.url == url }),
               let kind = MediaKind.classify(url) else { return }
