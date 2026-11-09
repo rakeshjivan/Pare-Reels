@@ -253,12 +253,13 @@ final class CropModel: ObservableObject {
                 result = await saveInstant(src: src, ff: ff, rect: rect)
                 note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
             case .fast:
-                if let r = await saveApple(src: src, rect: rect) {
+                // Main engine: ffmpeg with the Mac's hardware decoder and encoder (reports true speed).
+                if let r = await saveFast(src: src, ff: ff, rect: rect) {
                     result = r
-                } else if !cancelled {
-                    // Apple can't handle this file (unusual format): fall back to ffmpeg.
-                    result = await saveFast(src: src, ff: ff, rect: rect)
-                    note = " (Used the backup engine: \(fastEncoder).)"
+                    note = " Engine: \(fastEncoder)."
+                } else if !cancelled, let r = await saveApple(src: src, rect: rect) {
+                    result = r
+                    note = " (Used the backup engine: Apple export.)"
                 }
             case .secure:
                 let out = outputURL(for: src, ext: "mp4")
@@ -429,7 +430,7 @@ final class CropModel: ObservableObject {
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
-            final class Box: @unchecked Sendable { var done = 0.0; let started = Date() }
+            final class Box: @unchecked Sendable { var done = 0.0; var fps = 0.0; let started = Date() }
             let box = Box()
             let splitter = LineSplitter { [weak self] line in
                 guard trackProgress, total > 0 else { return }
@@ -437,10 +438,13 @@ final class CropModel: ObservableObject {
                     box.done = us / 1_000_000
                     let frac = min(max(box.done / total, 0), 1)
                     Task { @MainActor in self?.progress = frac }
+                } else if line.hasPrefix("fps="), let f = Double(line.dropFirst(4)) {
+                    box.fps = f
                 } else if line.hasPrefix("speed="), let sp = Double(line.dropFirst(6).replacingOccurrences(of: "x", with: "").trimmingCharacters(in: .whitespaces)), sp > 0 {
                     let left = max(0, total - box.done) / sp
                     let eta = left < 60 ? "under a minute left" : "about \(Int((left / 60).rounded())) min left"
-                    let text = Date().timeIntervalSince(box.started) < 30 ? "estimating time…" : String(format: "%.1f×", sp) + " · " + eta
+                    let text = Date().timeIntervalSince(box.started) < 20 ? "estimating time…"
+                        : String(format: "%.1f× · %.0f fps · ", sp, box.fps) + eta
                     Task { @MainActor in self?.liveInfo = text }
                 }
             }
