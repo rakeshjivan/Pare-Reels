@@ -428,10 +428,14 @@ final class DownloadModel: ObservableObject {
         finderTarget = nil
         if let i = items.firstIndex(where: { $0.id == itemID }) {
             items[i].needsFinder = false
+            items[i].needsAuth = true   // leaves "Unlock…" available for a password or browser login
             items[i].status = .cancelled
-            items[i].detail = ""
+            items[i].detail = "Cancelled. Click “Unlock…” to use a password or your browser login instead."
         }
-        promptNext()
+        // Move on to the next page that needs finding, without popping up the password box.
+        if let f = items.first(where: { $0.needsFinder }), let url = URL(string: f.url) {
+            finderTarget = FinderTarget(id: f.id, url: url)
+        }
     }
 
     /// The finder located the file: download it (and its sound, if separate).
@@ -543,7 +547,11 @@ final class DownloadModel: ObservableObject {
         } else {
             let err = lastErrors[i] ?? "The download didn't finish. See the log."
             items[i].status = .failed
-            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err)) {
+            let c = items[i].credentials
+            let triedLogin = browser != .none || !c.videoPassword.isEmpty || !c.username.isEmpty
+            if items[i].direct == nil && (isFinderError(err) || needsRegistration(err) || (isAuthError(err) && !triedLogin)) {
+                // The downloader can't get it on its own (e.g. Vimeo now wants a login):
+                // play the page in the finder window and take the file from there.
                 // The downloader can't read this page: look for the file on the page instead.
                 items[i].needsFinder = true
                 items[i].detail = "Finding the video on the page…"
