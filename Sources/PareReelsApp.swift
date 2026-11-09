@@ -145,6 +145,10 @@ enum Tools {
         .appendingPathComponent("Pare Reels/bin", isDirectory: true)
 
     static var ytdlp: URL { dir.appendingPathComponent("yt-dlp") }
+    /// Unfinished pieces of downloads live here, never in the user's Downloads folder.
+    static let partsRoot: URL = FileManager.default
+        .urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Pare Reels/parts", isDirectory: true)
     static var deno: URL { dir.appendingPathComponent("deno") }
 
     #if arch(arm64)
@@ -299,6 +303,7 @@ final class DownloadModel: ObservableObject {
 
     private var current: Process?
     private var cancelRequested = false
+    private var partsDir: URL?   // this download's unfinished pieces
     private var lastErrors: [Int: String] = [:]
     private var lastFiles: [Int: String] = [:]
     private var autoBrowserUsed: BrowserLogin?
@@ -340,6 +345,7 @@ final class DownloadModel: ObservableObject {
         do {
             try fm.createDirectory(at: Tools.dir, withIntermediateDirectories: true)
             Tools.stopBackgroundJobs()   // clean up anything left over from a previous session
+            try? fm.removeItem(at: Tools.partsRoot)   // and any unfinished pieces from it
 
             if fm.isExecutableFile(atPath: Tools.ytdlp.path) {
                 setupMessage = "Checking for updates…"
@@ -530,6 +536,7 @@ final class DownloadModel: ObservableObject {
             "--print", "before_dl:TITLE %(title)s", "--no-simulate",
             "--progress",   // --print switches on quiet mode, which hides progress unless asked for
         ]
+        if let parts = partsDir { a += ["-P", "temp:\(parts.path)"] }
         // YouTube serves each file as one slow, rate-limited stream. Asking for it as many small
         // pieces lets 32 of them download at once (16 if YouTube pushes back).
         // A refused piece must stop the download, never be silently left out of the file.
@@ -573,6 +580,14 @@ final class DownloadModel: ObservableObject {
         items[i].detail = "Starting…"
         appendLog("▶︎ \(items[i].url)")
         lastErrors[i] = nil
+        let parts = Tools.partsRoot.appendingPathComponent(items[i].id.uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: parts, withIntermediateDirectories: true)
+        partsDir = parts
+        // Finished, failed or cancelled: unfinished pieces never stay behind.
+        defer {
+            try? FileManager.default.removeItem(at: parts)
+            if partsDir == parts { partsDir = nil }
+        }
 
         var ok: Bool
         var note = ""
@@ -675,11 +690,13 @@ final class DownloadModel: ObservableObject {
 
     private static let progressTemplate = "download:PROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"
 
-    private func directArgs(_ job: DirectJob, output: String) -> [String] {
+    /// `intoParts`: the result is an in-between file (picture or sound on its own), so keep it with the pieces.
+    private func directArgs(_ job: DirectJob, output: String, intoParts: Bool = false) -> [String] {
+        let home = intoParts ? (partsDir ?? folder) : folder
         var a = [
             "--newline", "--color", "never", "--no-playlist",
             "-N", "8",   // fetch streamed videos in 8 pieces at once
-            "-P", folder.path, "-o", output,
+            "-P", home.path, "-o", output,
             "--progress-template", Self.progressTemplate,
             "--print", "after_move:FILE %(filepath)s", "--no-simulate",
             "--progress",
@@ -687,6 +704,7 @@ final class DownloadModel: ObservableObject {
             "--add-header", "User-Agent:\(job.userAgent)",
             "--cookies", job.cookiesFile.path,
         ]
+        if let parts = partsDir { a += ["-P", "temp:\(parts.path)"] }
         if let ff = ffmpeg { a += ["--ffmpeg-location", ff.deletingLastPathComponent().path] }
         return a
     }
@@ -712,7 +730,7 @@ final class DownloadModel: ObservableObject {
 
         // A whole file: download it, then check it has sound.
         lastFiles[i] = nil
-        guard await runYtdlp(directArgs(job, output: "\(template).part-video.%(ext)s") + ["--", job.primary], index: i) == 0,
+        guard await runYtdlp(directArgs(job, output: "\(template).part-video.%(ext)s", intoParts: true) + ["--", job.primary], index: i) == 0,
               let videoPath = lastFiles[i] else { return (false, "") }
 
         guard let ff = ffmpeg, let probe = Tools.find("ffprobe") else {
@@ -732,7 +750,7 @@ final class DownloadModel: ObservableObject {
             n += 1
             items[i].detail = "Getting the sound…"
             lastFiles[i] = nil
-            guard await runYtdlp(directArgs(job, output: "\(template).part-sound\(n).%(ext)s") + ["--", candidate], index: i) == 0,
+            guard await runYtdlp(directArgs(job, output: "\(template).part-sound\(n).%(ext)s", intoParts: true) + ["--", candidate], index: i) == 0,
                   let soundPath = lastFiles[i] else { continue }
             let s = await Self.streams(soundPath, probe: probe)
             guard s.contains("audio"), !s.contains("video") else {
@@ -764,7 +782,7 @@ final class DownloadModel: ObservableObject {
 
     private func finalize(_ path: String, name: String) {
         let src = URL(fileURLWithPath: path)
-        let dest = Self.uniqueURL(in: src.deletingLastPathComponent(), name: name, ext: src.pathExtension)
+        let dest = Self.uniqueURL(in: folder, name: name, ext: src.pathExtension)
         if (try? FileManager.default.moveItem(at: src, to: dest)) != nil { appendLog("Saved \(dest.path)") }
     }
 
