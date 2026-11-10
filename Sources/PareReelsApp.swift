@@ -21,6 +21,8 @@ struct PareReelsApp: App {
                     .tabItem { Label("Crop & Trim", systemImage: "crop") }
                 CompressView()
                     .tabItem { Label("Compress", systemImage: "arrow.down.right.and.arrow.up.left") }
+                CropView(mode: .gif)
+                    .tabItem { Label("GIF", systemImage: "photo.stack") }
             }
                 .environmentObject(model)
                 .frame(minWidth: 720, minHeight: 640)

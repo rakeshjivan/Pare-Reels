@@ -236,6 +236,54 @@ final class CropModel: ObservableObject {
     private var method: SaveMethod = .instant
     lazy var secure = SecureSaver()   // browser engine, kept for testing the Pare web tool (not shown)
 
+    /// Makes an animated GIF of the kept part (with crop, blur and speed), using a palette made
+    /// from the clip itself for the best colours a GIF allows.
+    func makeGIF(width: Int?, fps: Int) {
+        guard let src = url, !busy else { return }
+        guard let ff = Tools.find("ffmpeg") else {
+            status = "ffmpeg isn't installed yet. Open the Download tab once so Pare Reels can fetch it."
+            return
+        }
+        let clip = ((isTrimmed ? trimEnd - trimStart : duration)) / speed
+        guard clip <= 120 else {
+            status = "That's \(Int(clip / 60)) minutes. A GIF can only be up to 2 minutes: use Set Start and Set End to pick a shorter part."
+            return
+        }
+        method = .fast; compressing = false
+        busy = true; cancelled = false; savedFile = nil
+        progress = 0; liveInfo = nil
+        status = "Making GIF…"
+        let rect = pixelRect, sp = speed
+        let started = Date()
+        Task {
+            var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+            if isTrimmed { a += ["-ss", String(format: "%.3f", trimStart), "-t", String(format: "%.3f", trimEnd - trimStart)] }
+            a += ["-i", src.path, "-an"]
+            var f = "[0:v:0]" + (lookFilter(rect).map { $0 + "," } ?? "")
+            if abs(sp - 1) > 0.001 { f += String(format: "setpts=PTS/%.4f,", sp) }
+            f += "fps=\(fps)"
+            if let w = width { f += ",scale='min(\(w),iw)':-2:flags=lanczos" }
+            f += ",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+            let out = outputURL(for: src, ext: "gif", gif: true)
+            a += ["-filter_complex", f, "-loop", "0", out.path]
+            let code = await run(ff, a, trackProgress: true)
+            let secs = Date().timeIntervalSince(started)
+            busy = false; progress = nil; liveInfo = nil
+            if cancelled {
+                try? FileManager.default.removeItem(at: out)
+                status = "Cancelled."
+            } else if code == 0 {
+                savedFile = out
+                let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
+                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs)) · \(String(format: mb < 10 ? "%.1f" : "%.0f", mb)) MB."
+                    + (mb > 15 ? " That's large for a GIF: a shorter clip, smaller size or fewer frames per second will make it smaller." : "")
+            } else {
+                try? FileManager.default.removeItem(at: out)
+                status = "Making the GIF failed."
+            }
+        }
+    }
+
     func cancel() {
         cancelled = true
         process?.terminate()
@@ -258,12 +306,12 @@ final class CropModel: ObservableObject {
         return base.isEmpty ? "copy" : base
     }
 
-    private func outputURL(for src: URL, ext: String) -> URL {
+    private func outputURL(for src: URL, ext: String, gif: Bool = false) -> URL {
         var dir = src.deletingLastPathComponent()
         if !FileManager.default.isWritableFile(atPath: dir.path) {
             dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
-        let base = src.deletingPathExtension().lastPathComponent + " (\(suffix))"
+        let base = src.deletingPathExtension().lastPathComponent + (gif ? " (GIF)" : " (\(suffix))")
         return DownloadModel.uniqueURL(in: dir, name: base, ext: ext)
     }
 
@@ -793,7 +841,11 @@ final class CropModel: ObservableObject {
 // MARK: - View
 
 struct CropView: View {
+    enum Mode { case edit, gif }
+    var mode: Mode = .edit
     @StateObject private var model = CropModel()
+    @State private var gifWidth = 640       // 0 = full size
+    @State private var gifFPS = 15
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -865,10 +917,18 @@ struct CropView: View {
                     Text("Blur boxes stay in the same spot for the whole video; they don't follow a face that moves.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if mode == .gif {
+                    let len = (model.trimEnd - model.trimStart) / model.speed
+                    Text(len > 20
+                         ? String(format: "This GIF would be %.0f seconds long. GIFs get large quickly: use Set Start and Set End to pick a short moment (under about 15 seconds).", len)
+                         : "Use Set Start and Set End to pick the moment. Crop, blur and speed all apply to the GIF. It loops forever and has no sound.")
+                        .font(.caption).foregroundStyle(len > 20 ? .orange : .secondary)
+                } else {
                 Text(model.isCropped || model.hasEffects
                      ? "Saving rebuilds the video: cropped-out and blurred areas are permanently removed, and cuts are exact. This takes a few minutes for long videos."
                      : "Trim only: saves in seconds. The cut starts at the nearest keyframe, up to a few seconds early.")
                     .font(.caption).foregroundStyle(.secondary)
+                }
 
                 HStack(spacing: 12) {
                     let r = model.pixelRect
@@ -883,6 +943,18 @@ struct CropView: View {
                             ProgressView().controlSize(.small)
                         }
                         Button("Cancel") { model.cancel() }
+                    } else if mode == .gif {
+                        Picker("Size", selection: $gifWidth) {
+                            Text("Small (480)").tag(480); Text("Medium (640)").tag(640)
+                            Text("Large (800)").tag(800); Text("Full size").tag(0)
+                        }
+                        .frame(width: 190)
+                        Picker("Smoothness", selection: $gifFPS) {
+                            Text("10 fps").tag(10); Text("15 fps").tag(15); Text("20 fps").tag(20)
+                        }
+                        .frame(width: 190)
+                        Button("Make GIF") { model.makeGIF(width: gifWidth == 0 ? nil : gifWidth, fps: gifFPS) }
+                            .keyboardShortcut(.defaultAction)
                     } else {
                         Button("Compress & Save") { model.save(.fast, compress: true) }
                             .alert("This video can't be made any smaller", isPresented: $model.offerPlainSave) {
