@@ -22,7 +22,9 @@ struct PareReelsApp: App {
                 CompressView()
                     .tabItem { Label("Compress", systemImage: "arrow.down.right.and.arrow.up.left") }
                 CropView(mode: .gif)
-                    .tabItem { Label("GIF", systemImage: "photo.stack") }
+                    .tabItem { Label("Video to GIF", systemImage: "photo.stack") }
+                ImagesToGIFView()
+                    .tabItem { Label("Images to GIF", systemImage: "photo.on.rectangle.angled") }
                 CropView(mode: .frame)
                     .tabItem { Label("Frame", systemImage: "circle.dashed.rectangle") }
             }
