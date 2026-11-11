@@ -83,6 +83,23 @@ final class CropModel: ObservableObject {
     /// Anything that needs the picture rebuilt besides a crop.
     var hasEffects: Bool { !blurs.isEmpty || abs(speed - 1) > 0.001 }
     func addBlur() { blurs.append(CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)) }
+
+    // Frame tab: the box becomes a shaped window (rounded box or circle) with an optional border.
+    enum FrameShape: String, CaseIterable, Identifiable { case rounded = "Rounded box", circle = "Circle"; var id: String { rawValue } }
+    @Published var frameMode = false
+    @Published var frameShape: FrameShape = .rounded { didSet { if frameShape == .circle { aspect = .square } } }
+    @Published var cornerFrac: Double = 0.12        // corner radius as a share of the box's shorter side
+    @Published var borderFrac: Double = 0           // border width as a share of the shorter side
+    @Published var borderColor: Color = .white
+    @Published var transparentBackground = true
+    @Published var backgroundColor: Color = .black
+    /// Corner radius as a share of the shorter side (a circle is half).
+    var radiusFrac: Double { frameShape == .circle ? 0.5 : cornerFrac }
+
+    static func hex(_ c: Color) -> String {
+        let n = NSColor(c).usingColorSpace(.sRGB) ?? .white
+        return String(format: "0x%02X%02X%02X", Int(n.redComponent * 255), Int(n.greenComponent * 255), Int(n.blueComponent * 255))
+    }
     var isTrimmed: Bool { trimStart > 0.05 || trimEnd < duration - 0.05 }
     /// Trimming alone works on any video; cropping instantly needs H.264/HEVC that isn't rotated.
     var canInstant: Bool { !isCropped || ((codec == "h264" || codec == "hevc") && !rotated) }
@@ -280,6 +297,111 @@ final class CropModel: ObservableObject {
             } else {
                 try? FileManager.default.removeItem(at: out)
                 status = "Making the GIF failed."
+            }
+        }
+    }
+
+    /// Frame tab: saves the box as a shaped video (rounded box or circle), with an optional border,
+    /// on a transparent or coloured background. GIF or video.
+    func makeFramed(gif: Bool, gifWidth: Int?, gifFPS: Int) {
+        guard let src = url, !busy else { return }
+        guard let ff = Tools.find("ffmpeg") else {
+            status = "ffmpeg isn't installed yet. Open the Download tab once so Pare Reels can fetch it."
+            return
+        }
+        let clip = (isTrimmed ? trimEnd - trimStart : duration) / speed
+        if gif, clip > 120 {
+            status = "That's \(Int(clip / 60)) minutes. A GIF can only be up to 2 minutes: use Set Start and Set End to pick a shorter part."
+            return
+        }
+        method = .fast; compressing = false
+        busy = true; cancelled = false; savedFile = nil
+        progress = 0; liveInfo = nil
+        status = gif ? "Making framed GIF…" : "Saving framed video…"
+        let rect = pixelRect, sp = speed
+        let W = Int(rect.width), H = Int(rect.height)
+        let side = Double(min(W, H))
+        let B = borderFrac > 0 ? max(2, Int((borderFrac * side).rounded())) : 0
+        let R = max(Int((radiusFrac * side).rounded()), B + 1)
+        let transparent = transparentBackground
+        let bg = Self.hex(backgroundColor), bc = Self.hex(borderColor)
+        let rate = max(1, fps)
+        let started = Date()
+        Task {
+            let work = FileManager.default.temporaryDirectory.appendingPathComponent("pare-frame-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: work) }
+            // Smooth-edged masks, drawn at 4× size and shrunk.
+            let S = 4, W4 = W * S, H4 = H * S, R4 = R * S, B4 = B * S
+            func inside(_ inset: Int) -> String {
+                "lte(hypot(max(0\\,abs(X-\(W4)/2)-(\(W4)/2-\(R4)))\\,max(0\\,abs(Y-\(H4)/2)-(\(H4)/2-\(R4))))\\,\(R4 - inset))"
+            }
+            let mask = work.appendingPathComponent("mask.png"), ring = work.appendingPathComponent("border.png")
+            var code = await run(ff, ["-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                      "color=c=black:s=\(W4)x\(H4),format=gray,geq=lum='255*\(inside(0))'",
+                                      "-frames:v", "1", "-vf", "scale=\(W):\(H):flags=area", mask.path])
+            if code == 0, B > 0 {
+                let c = bc.dropFirst(2)
+                let r = Int(c.prefix(2), radix: 16) ?? 255, g = Int(c.dropFirst(2).prefix(2), radix: 16) ?? 255, b = Int(c.suffix(2), radix: 16) ?? 255
+                code = await run(ff, ["-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                      "color=c=black:s=\(W4)x\(H4),format=rgba,geq=r=\(r):g=\(g):b=\(b):a='255*\(inside(0))*(1-\(inside(B4)))'",
+                                      "-frames:v", "1", "-vf", "scale=\(W):\(H):flags=area", ring.path])
+            }
+            let out = outputURL(for: src, ext: gif ? "gif" : (transparent ? "mov" : "mp4"), gif: gif)
+            if code == 0, !cancelled {
+                var a = ["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+                if isTrimmed { a += ["-ss", String(format: "%.3f", trimStart), "-t", String(format: "%.3f", trimEnd - trimStart)] }
+                a += ["-i", src.path, "-i", mask.path]
+                if B > 0 { a += ["-i", ring.path] }
+                var f = "[0:v:0]" + (lookFilter(rect).map { $0 + "," } ?? "")
+                if !isCropped { f += cropFilter(rect) + "," }
+                if abs(sp - 1) > 0.001 { f += String(format: "setpts=PTS/%.4f,", sp) }
+                f += "format=rgba[v];[1:v]format=gray[m];[v][m]alphamerge[a];"
+                f += B > 0 ? "[a][2:v]overlay=0:0:format=auto[o];" : "[a]null[o];"
+                if !transparent {
+                    f += "color=c=\(bg):s=\(W)x\(H):r=\(String(format: "%.3f", rate))[bg];[bg][o]overlay=shortest=1:format=auto[o2];"
+                } else {
+                    f += "[o]null[o2];"
+                }
+                if gif {
+                    f += "[o2]fps=\(gifFPS)"
+                    if let w = gifWidth { f += ",scale='min(\(w),iw)':-2:flags=lanczos" }
+                    f += transparent
+                        ? ",split[x][y];[x]palettegen=reserve_transparent=1:stats_mode=diff[p];[y][p]paletteuse=alpha_threshold=128:dither=bayer:bayer_scale=5[out]"
+                        : ",split[x][y];[x]palettegen=stats_mode=diff[p];[y][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[out]"
+                    a += ["-filter_complex", f, "-map", "[out]", "-loop", "0", out.path]
+                    code = await run(ff, a, trackProgress: true)
+                } else {
+                    f += transparent ? "[o2]format=bgra[out]" : "[o2]format=yuv420p[out]"
+                    a += ["-filter_complex", f, "-map", "[out]", "-map", "0:a?"]
+                    if abs(sp - 1) > 0.001 { a += ["-af", String(format: "atempo=%.4f", sp)] }
+                    let audio = ["-c:a", "aac", "-b:a", "192k"]
+                    if transparent {
+                        // HEVC with transparency: plays in QuickTime and drops into Keynote, iMovie and Final Cut.
+                        code = await run(ff, a + ["-c:v", "hevc_videotoolbox", "-alpha_quality", "0.75", "-q:v", "65", "-tag:v", "hvc1"] + audio + [out.path], trackProgress: true)
+                        if code != 0, !cancelled {   // backup: ProRes 4444 (bigger, but works everywhere on a Mac)
+                            try? FileManager.default.removeItem(at: out)
+                            code = await run(ff, a.map { $0.replacingOccurrences(of: "[o2]format=bgra[out]", with: "[o2]format=yuva444p10le[out]") }
+                                             + ["-c:v", "prores_ks", "-profile:v", "4444"] + audio + [out.path], trackProgress: true)
+                        }
+                    } else {
+                        code = await run(ff, a + ["-c:v", "h264_videotoolbox", "-q:v", "65"] + audio + ["-movflags", "+faststart", out.path], trackProgress: true)
+                    }
+                }
+            }
+            let secs = Date().timeIntervalSince(started)
+            busy = false; progress = nil; liveInfo = nil
+            if cancelled {
+                try? FileManager.default.removeItem(at: out)
+                status = "Cancelled."
+            } else if code == 0 {
+                savedFile = out
+                let mb = Double((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
+                status = "Saved “\(out.lastPathComponent)” in \(Self.duration(secs)) · \(String(format: mb < 10 ? "%.1f" : "%.0f", mb)) MB."
+                    + (transparent && !gif ? " The background is see-through: drop it onto a slide in Keynote or PowerPoint, or into iMovie." : "")
+            } else {
+                try? FileManager.default.removeItem(at: out)
+                status = "Saving the framed version failed."
             }
         }
     }
@@ -841,7 +963,7 @@ final class CropModel: ObservableObject {
 // MARK: - View
 
 struct CropView: View {
-    enum Mode { case edit, gif }
+    enum Mode { case edit, gif, frame }
     var mode: Mode = .edit
     @StateObject private var model = CropModel()
     @State private var gifWidth = 640       // 0 = full size
@@ -917,7 +1039,31 @@ struct CropView: View {
                     Text("Blur boxes stay in the same spot for the whole video; they don't follow a face that moves.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if mode == .gif {
+                if mode == .frame {
+                    HStack(spacing: 14) {
+                        Picker("Frame", selection: $model.frameShape) {
+                            ForEach(CropModel.FrameShape.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .frame(width: 200)
+                        if model.frameShape == .rounded {
+                            Text("Corners")
+                            Slider(value: $model.cornerFrac, in: 0...0.5).frame(width: 110)
+                        }
+                        Picker("Border", selection: $model.borderFrac) {
+                            Text("None").tag(0.0); Text("Thin").tag(0.015); Text("Medium").tag(0.03); Text("Thick").tag(0.05)
+                        }
+                        .frame(width: 150)
+                        if model.borderFrac > 0 { ColorPicker("", selection: $model.borderColor).labelsHidden() }
+                        Picker("Background", selection: $model.transparentBackground) {
+                            Text("See-through").tag(true); Text("Colour").tag(false)
+                        }
+                        .frame(width: 210)
+                        if !model.transparentBackground { ColorPicker("", selection: $model.backgroundColor).labelsHidden() }
+                    }
+                    .disabled(model.busy)
+                    Text("Drag the box to choose what shows in the frame. See-through videos save as .mov and drop straight onto a Keynote or PowerPoint slide, e.g. a round presenter bubble. Trim, blur and speed apply too.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if mode == .gif {
                     let len = (model.trimEnd - model.trimStart) / model.speed
                     Text(len > 20
                          ? String(format: "This GIF would be %.0f seconds long. GIFs get large quickly: use Set Start and Set End to pick a short moment (under about 15 seconds).", len)
@@ -943,6 +1089,10 @@ struct CropView: View {
                             ProgressView().controlSize(.small)
                         }
                         Button("Cancel") { model.cancel() }
+                    } else if mode == .frame {
+                        Button("Make GIF") { model.makeFramed(gif: true, gifWidth: 480, gifFPS: 15) }
+                        Button("Save Video") { model.makeFramed(gif: false, gifWidth: nil, gifFPS: 15) }
+                            .keyboardShortcut(.defaultAction)
                     } else if mode == .gif {
                         Picker("Size", selection: $gifWidth) {
                             Text("Small (480)").tag(480); Text("Medium (640)").tag(640)
@@ -983,6 +1133,7 @@ struct CropView: View {
             }
         }
         .padding(20)
+        .onAppear { model.frameMode = mode == .frame }
     }
 
     private func timeString(_ s: Double) -> String {
@@ -1038,6 +1189,25 @@ struct CropCanvas: View {
                 }
                 .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
                 .allowsHitTesting(false)
+
+                // Frame tab: show the shape and border on the box.
+                if model.frameMode {
+                    let r = model.radiusFrac * min(box.width, box.height)
+                    Path { p in
+                        p.addRect(box)
+                        p.addRoundedRect(in: box, cornerSize: CGSize(width: r, height: r))
+                    }
+                    .fill(model.transparentBackground ? Color.black.opacity(0.55) : model.backgroundColor,
+                          style: FillStyle(eoFill: true))
+                    .allowsHitTesting(false)
+                    if model.borderFrac > 0 {
+                        RoundedRectangle(cornerRadius: r)
+                            .strokeBorder(model.borderColor, lineWidth: max(1, model.borderFrac * min(box.width, box.height)))
+                            .frame(width: box.width, height: box.height)
+                            .offset(x: box.minX, y: box.minY)
+                            .allowsHitTesting(false)
+                    }
+                }
 
                 // Box, thirds guide, and the area you drag to move it.
                 ZStack {
