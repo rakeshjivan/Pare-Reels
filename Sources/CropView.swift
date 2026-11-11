@@ -6,6 +6,7 @@ import SwiftUI
 import AVFoundation
 import AppKit
 import UniformTypeIdentifiers
+import ImageIO
 
 // MARK: - Aspect presets
 
@@ -148,13 +149,60 @@ final class CropModel: ObservableObject {
 
     func choose() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .gif]
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let u = panel.url { Task { await open(u) } }
     }
 
+    /// GIFs can't be read by Apple's video framework, so they're measured and previewed with ffmpeg.
+    @Published var isGIF = false
+
+    private func openGIF(_ url: URL) async -> Bool {
+        guard let probe = Tools.find("ffprobe") else {
+            status = "ffprobe isn't installed yet. Open the Download tab once so Pare Reels can fetch it."
+            return false
+        }
+        let (_, out) = await Tools.capture(probe.path, ["-v", "error", "-select_streams", "v:0", "-count_packets",
+            "-show_entries", "stream=width,height,nb_read_packets,avg_frame_rate:format=duration", "-of", "default=noprint_wrappers=1", url.path])
+        var vals: [String: String] = [:]
+        for line in out.split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1)
+            if kv.count == 2 { vals[String(kv[0])] = String(kv[1]) }
+        }
+        guard let w = Double(vals["width"] ?? ""), let h = Double(vals["height"] ?? "") else {
+            status = "Couldn't open that GIF."
+            return false
+        }
+        let frames = Double(vals["nb_read_packets"] ?? "") ?? 0
+        let rate: Double = {
+            let p = (vals["avg_frame_rate"] ?? "").split(separator: "/").compactMap { Double($0) }
+            return p.count == 2 && p[1] > 0 && p[0] > 0 ? p[0] / p[1] : 10
+        }()
+        videoSize = CGSize(width: w, height: h)
+        rotated = false
+        codec = "gif"
+        fps = rate
+        duration = Double(vals["duration"] ?? "") ?? (frames > 0 ? frames / rate : 1)
+        isGIF = true
+        return true
+    }
+
     func open(_ url: URL) async {
         status = nil; savedFile = nil
+        isGIF = false
+        if url.pathExtension.lowercased() == "gif" {
+            guard await openGIF(url) else { return }
+            generator = nil
+            self.url = url
+            crop = CGRect(x: 0, y: 0, width: 1, height: 1)
+            blurs = []; speed = 1
+            applyAspect()
+            trimStart = 0
+            trimEnd = duration
+            time = 0
+            await refreshFrame()
+            return
+        }
         let asset = AVURLAsset(url: url)
         do {
             guard let track = try await asset.loadTracks(withMediaType: .video).first else {
@@ -196,6 +244,19 @@ final class CropModel: ObservableObject {
     }
 
     func refreshFrame() async {
+        if isGIF, let u = url, let ff = Tools.find("ffmpeg") {
+            frameRequest += 1
+            let mine = frameRequest
+            let png = FileManager.default.temporaryDirectory.appendingPathComponent("pare-gif-frame-\(UUID().uuidString).png")
+            defer { try? FileManager.default.removeItem(at: png) }
+            _ = await Tools.capture(ff.path, ["-y", "-loglevel", "error", "-ss", String(format: "%.3f", min(time, max(0, duration - 0.05))),
+                                              "-i", u.path, "-frames:v", "1", png.path])
+            if mine == frameRequest, let src = CGImageSourceCreateWithURL(png as CFURL, nil),
+               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+                frame = img
+            }
+            return
+        }
         guard let g = generator else { return }
         frameRequest += 1
         let mine = frameRequest
@@ -471,7 +532,7 @@ final class CropModel: ObservableObject {
                     result = r
                     note = " Quality: \(pick.label). Engine: \(fastEncoder), HEVC."
                 }
-            case .fast where !isCropped && !hasEffects:
+            case .fast where !isCropped && !hasEffects && !isGIF:
                 // Trim only: no rebuild needed — instant, works in every player.
                 result = await saveInstant(src: src, ff: ff, rect: rect)
                 note = " Trimmed instantly (starts at the nearest keyframe, up to a few seconds early)."
@@ -844,7 +905,7 @@ final class CropModel: ObservableObject {
         var codes: [Int32] = []
         await withTaskGroup(of: [Int32].self) { group in
             for w in 0..<n {
-                let decode = w < hwParts ? ["-hwaccel", "videotoolbox"] : ["-threads", "2"]
+                let decode = w < hwParts && !isGIF ? ["-hwaccel", "videotoolbox"] : ["-threads", "2"]
                 group.addTask {
                     var mine: [Int32] = []
                     while let i = line.take() {
