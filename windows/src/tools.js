@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn, execFile } = require('child_process');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const extract = require('extract-zip');
 
@@ -28,9 +28,12 @@ async function download(url, dest, onProgress) {
   const total = Number(res.headers.get('content-length')) || 0;
   let got = 0;
   const tmp = dest + '.part';
-  const body = Readable.fromWeb(res.body);
-  body.on('data', (c) => { got += c.length; if (total && onProgress) onProgress(got / total); });
-  await pipeline(body, fs.createWriteStream(tmp));
+  // Count bytes as they pass through on their way to the file (nothing is read twice or lost).
+  const counter = new Transform({
+    transform(chunk, _enc, cb) { got += chunk.length; if (total && onProgress) onProgress(got / total); cb(null, chunk); },
+  });
+  await pipeline(Readable.fromWeb(res.body), counter, fs.createWriteStream(tmp));
+  if (total && got !== total) throw new Error(`download incomplete (${got} of ${total} bytes) for ${url}`);
   fs.renameSync(tmp, dest);
 }
 
