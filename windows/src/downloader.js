@@ -234,7 +234,8 @@ class Downloader extends EventEmitter {
   ytdlp(args, i) {
     return new Promise((resolve) => {
       const item = this.items[i];
-      const env = { ...process.env, PATH: `${tools.dir};${process.env.PATH || ''}` };
+      // UTF-8 output, so titles with accents, emoji or other scripts come through intact.
+      const env = { ...process.env, PATH: `${tools.dir};${process.env.PATH || ''}`, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
       let p;
       try {
         p = spawn(tools.exe('yt-dlp'), args, { cwd: this.settings.folder, env, windowsHide: true });
