@@ -3,6 +3,7 @@ name: Build Pare Reels
 on:
   push:
     branches: [main]    # every change to main builds and publishes a release
+    paths-ignore: ['windows/**', '.github/workflows/release-windows.yml']   # Windows changes don't need a new Mac build
   workflow_dispatch:    # or click "Run workflow" on the Actions tab
 
 permissions:

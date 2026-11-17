@@ -1,0 +1,46 @@
+name: Build Pare Reels for Windows
+
+on:
+  push:
+    branches: [main]
+    paths: ['windows/**', '.github/workflows/release-windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm ci
+      - name: Build installer
+        run: npx electron-builder --win nsis --x64 --publish never "-c.extraMetadata.version=1.0.${{ github.run_number }}"
+      - name: Test the app (setup, downloads, video finder)
+        run: node test/smoke.js
+      - name: Keep installer as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pare-Reels-Windows
+          path: windows/dist/Pare-Reels-Setup.exe
+      # Marked as a pre-release so the Mac app's update check (which reads "latest") never picks it up.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-${{ github.run_number }}
+          name: Pare Reels for Windows (build ${{ github.run_number }})
+          files: windows/dist/Pare-Reels-Setup.exe
+          prerelease: true
+          make_latest: false
+          body: |
+            Pare Reels for Windows, build ${{ github.run_number }}.
+            Download **Pare-Reels-Setup.exe** and open it. If Windows shows "Windows protected your PC", click **More info**, then **Run anyway**.

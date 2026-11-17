@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>Pare Reels</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="update" class="banner" hidden>
+    <span id="updateText">A new version of Pare Reels is ready.</span>
+    <button id="updateBtn" class="primary">Restart to Update</button>
+  </div>
+  <div id="setup" class="banner info"><span id="setupText">Getting things ready…</span><button id="setupRetry" hidden>Try Again</button></div>
+
+  <label class="heading" for="links">Paste one or more links (one per line)</label>
+  <textarea id="links" spellcheck="false" placeholder="https://www.youtube.com/watch?v=…"></textarea>
+
+  <div class="row">
+    <label>Quality <select id="quality"></select></label>
+    <label title="Automatic tries without a login first, then with your Firefox login only if the site asks for one. For other sites, Pare Reels opens the page so you can sign in there.">Use login from
+      <select id="login">
+        <option value="auto">Automatic</option>
+        <option value="none">Don't use</option>
+        <option value="firefox">Firefox</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="row">
+    <span class="muted">Save to:</span> <span id="folder" class="path"></span>
+    <span class="spacer"></span>
+    <button id="change">Change…</button>
+    <button id="open">Open Folder</button>
+  </div>
+
+  <div class="row">
+    <button id="download" class="primary" disabled>Download</button>
+    <button id="cancel" hidden>Cancel</button>
+    <button id="clear">Clear</button>
+    <span id="notice" class="notice"></span>
+    <span class="spacer"></span>
+    <span id="updateStatus" class="muted small"></span>
+    <button id="checkUpdate">Check for Updates</button>
+  </div>
+
+  <div id="items"></div>
+
+  <details id="logBox">
+    <summary>Log · <span id="build"></span></summary>
+    <pre id="log"></pre>
+  </details>
+
+  <dialog id="unlock">
+    <form method="dialog">
+      <h3>Unlock this video</h3>
+      <p class="muted small" id="unlockFor"></p>
+      <label>Video password (Vimeo and similar)<input id="vpass" type="password" autocomplete="off"></label>
+      <p class="muted small">Or a username and password for the site:</p>
+      <label>Username or email<input id="user" autocomplete="off"></label>
+      <label>Password<input id="pass" type="password" autocomplete="off"></label>
+      <p class="muted small">Pare Reels uses these for this download only and never saves them.</p>
+      <div class="row end">
+        <button value="find" id="unlockFind">Sign In on the Page Instead…</button>
+        <button value="cancel">Cancel</button>
+        <button value="ok" class="primary">Try Again</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

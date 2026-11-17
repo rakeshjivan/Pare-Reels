@@ -1,0 +1,35 @@
+:root { color-scheme: light dark; --accent: #2f6fed; --line: rgba(128,128,128,.28); --soft: rgba(128,128,128,.08); }
+* { box-sizing: border-box; }
+body { font: 14px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; margin: 0; padding: 18px 22px; display: flex; flex-direction: column; gap: 12px; min-height: 100vh; }
+.heading { font-weight: 600; font-size: 15px; }
+textarea { width: 100%; min-height: 110px; max-height: 200px; resize: vertical; font: 13px/1.5 Consolas, "Cascadia Mono", monospace; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.row.end { justify-content: flex-end; margin-top: 10px; }
+.spacer { flex: 1; }
+label { display: inline-flex; align-items: center; gap: 8px; }
+select, input { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: Canvas; color: inherit; }
+button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--soft); color: inherit; cursor: pointer; }
+button:hover:not(:disabled) { filter: brightness(0.95); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.muted { opacity: .7; }
+.small { font-size: 12px; }
+.path { font-family: Consolas, monospace; }
+.notice { color: #c0392b; }
+.banner { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: 8px; background: rgba(47,111,237,.12); }
+.banner.info { background: var(--soft); }
+#items { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.item .top { display: flex; gap: 10px; align-items: center; }
+.item .title { font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .state { font-size: 12px; opacity: .75; }
+.bar { height: 6px; background: var(--soft); border-radius: 3px; margin: 8px 0 6px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+.item.done .bar > div { background: #2e9d57; }
+.item.failed .bar > div { background: #c0392b; }
+.item .detail { font-size: 12px; opacity: .8; }
+.item button { padding: 3px 10px; font-size: 12px; }
+details pre { max-height: 220px; overflow: auto; font: 12px/1.4 Consolas, monospace; background: var(--soft); padding: 8px; border-radius: 6px; white-space: pre-wrap; }
+dialog { border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; width: 440px; background: Canvas; color: inherit; }
+dialog label { display: flex; flex-direction: column; align-items: stretch; gap: 4px; margin: 8px 0; }
+dialog h3 { margin: 0 0 4px; }
